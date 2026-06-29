@@ -60,7 +60,7 @@ def _get_drive_service():
     info = json.loads(sa_json)
     # GitHub Secretsの改行エスケープ問題を修正（\\n → 実改行）
     if "private_key" in info:
-        info["private_key"] = info["private_key"].replace("\\\\n", "\\n")
+        info["private_key"] = info["private_key"].replace(chr(92) + chr(110), chr(10))
     creds = Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive"]
     )
