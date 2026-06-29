@@ -58,6 +58,9 @@ def _get_drive_service():
     from googleapiclient.discovery import build
     sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     info = json.loads(sa_json)
+    # GitHub Secretsの改行エスケープ問題を修正（\\n → 実改行）
+    if "private_key" in info:
+        info["private_key"] = info["private_key"].replace("\\\\n", "\\n")
     creds = Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive"]
     )
