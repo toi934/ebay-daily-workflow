@@ -578,25 +578,16 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     print("    入力結果: " + json.dumps(filled, ensure_ascii=False))
     time.sleep(1)
 
-    # ★ 残存モーダルを閉じる（前の注文の内側モーダルが残っている場合）
-    page.evaluate(
-        """() => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            // 表示中の「閉じる」ボタンをすべてクリック
-            btns.filter(b => (b.textContent||'').trim() === '閉じる' && b.offsetParent !== null)
-                .forEach(b => b.click());
-        }"""
-    )
-    time.sleep(1)
-
     # 2. 「配送を割り当て」クリック → 内側モーダルが開く → DHL「選択」→価格取得
     print("  「配送を割り当て」クリック...")
     dhl_price = None
     clicked_assign = False
+    # ★ ダイアログ内に限定（ツールバーの btnAssignShipping を誤クリックしない）
     for sel in [
-        'button:has-text("配送を割り当て")',
-        'a:has-text("配送を割り当て")',
-        'button:has-text("Assign Shipping")',
+        '.ant-drawer-body button:has-text("配送を割り当て")',
+        '.ant-modal-content button:has-text("配送を割り当て")',
+        '[role="dialog"] button:has-text("配送を割り当て")',
+        'button:has-text("配送を割り当て"):not(#btnAssignShipping)',
     ]:
         try:
             page.locator(sel).first.click(timeout=3000)
@@ -676,16 +667,27 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         print("    警告: 「配送を割り当て」ボタンが見つかりません")
         _save_screenshot(page, "cpass_action_ss.png")
 
-    # 3. 「保存する」ボタンを座標クリック
+    # 3. 「保存する」ボタンを座標クリック（ダイアログ内を優先）
     time.sleep(1)
     saved = False
     rect_save = page.evaluate(
         """() => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            const btn = btns.find(b => (b.textContent||'').trim() === '保存する' && b.offsetParent !== null);
-            if (!btn) return null;
-            const r = btn.getBoundingClientRect();
-            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+            // ダイアログ内を優先して探す（ツールバーボタンとの混同を防ぐ）
+            const containers = [
+                document.querySelector('.ant-drawer-body'),
+                document.querySelector('.ant-modal-content'),
+                document.querySelector('[role="dialog"]'),
+                document.body
+            ].filter(Boolean);
+            for (const container of containers) {
+                const btns = Array.from(container.querySelectorAll('button'));
+                const btn = btns.find(b => (b.textContent||'').trim() === '保存する' && b.offsetParent !== null);
+                if (btn) {
+                    const r = btn.getBoundingClientRect();
+                    return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+                }
+            }
+            return null;
         }"""
     )
     if rect_save and rect_save.get('x'):
@@ -694,8 +696,13 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         print("    保存する [OK]")
         time.sleep(2)
     else:
-        # fallback: locator
-        for sel in ['button:has-text("保存する")', 'button:has-text("保存")']:
+        # fallback: ダイアログ内に限定したlocator
+        for sel in [
+            '.ant-drawer-body button:has-text("保存する")',
+            '.ant-modal-content button:has-text("保存する")',
+            '[role="dialog"] button:has-text("保存する")',
+            'button:has-text("保存する")',
+        ]:
             try:
                 page.locator(sel).first.click(timeout=3000)
                 saved = True
@@ -834,6 +841,17 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                 dims = dimension_weight_lookup.lookup_dimensions_weight(order.get("title", ""))
                 hs_code = hs_code_lookup.lookup_hs_code(order.get("title", ""))
                 print("  推定: " + dims["category"] + " / HS=" + hs_code)
+
+                # ★ 前の注文の残存内側モーダルを閉じる
+                # （編集ダイアログを開く前に実行することで、開いたダイアログを誤閉じしない）
+                page.evaluate(
+                    """() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        btns.filter(b => (b.textContent||'').trim() === '閉じる' && b.offsetParent !== null)
+                            .forEach(b => b.click());
+                    }"""
+                )
+                time.sleep(0.5)
 
                 # ★「発送手続き」タブで「詳細を見る」からダイアログを開く
                 if not _open_edit_dialog(page, order["order_no"]):
