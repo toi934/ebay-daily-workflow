@@ -1,9 +1,16 @@
 name: タスク2 売上管理表 自動更新
+
 on:
   schedule:
-    # 毎日 JST 11:00 = UTC 02:00
-    - cron: '0 2 * * *'
+    # ★GitHubのcron遅延(9〜13時間)対策（2026/07/03変更）
+    # 15分おきに起動し、ガードステップで「JST 11:00〜13:59 かつ 本日未実行」の
+    # 場合のみ本処理を実行する。それ以外は数秒で終了（publicリポジトリのため無料）。
+    - cron: '*/15 * * * *'
   workflow_dispatch:
+
+concurrency:
+  group: daily-workflow
+  cancel-in-progress: false
 
 jobs:
   daily-workflow:
@@ -14,18 +21,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Guard (JST 11:00-13:59 / 1日1回 / 手動は常に実行)
+        id: guard
+        run: |
+          HOUR_JST=$(TZ=Asia/Tokyo date +%H)
+          TODAY_JST=$(TZ=Asia/Tokyo date +%F)
+          LAST=$(cat last_run_date.txt 2>/dev/null || echo none)
+          echo "now(JST)=$(TZ=Asia/Tokyo date '+%F %T') last_run=$LAST"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          elif [ "$LAST" = "$TODAY_JST" ]; then
+            echo "run=false" >> $GITHUB_OUTPUT
+          elif [ "$HOUR_JST" -ge 11 ] && [ "$HOUR_JST" -le 13 ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Set up Python
+        if: steps.guard.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Install dependencies
+        if: steps.guard.outputs.run == 'true'
         run: |
           pip install -r requirements.txt
           playwright install chromium
           playwright install-deps chromium
 
       - name: Run daily workflow
+        if: steps.guard.outputs.run == 'true'
         env:
           CPASS_EMAIL: ${{ secrets.CPASS_EMAIL }}
           CPASS_PASSWORD: ${{ secrets.CPASS_PASSWORD }}
@@ -34,9 +61,11 @@ jobs:
         run: python daily_workflow_ga.py
 
       - name: Commit run count
+        if: steps.guard.outputs.run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add run_count_task2.txt || true
+          TZ=Asia/Tokyo date +%F > last_run_date.txt
+          git add run_count_task2.txt last_run_date.txt || true
           git diff --staged --quiet || git commit -m "Update run count task2"
           git push || true
