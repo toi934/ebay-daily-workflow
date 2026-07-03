@@ -181,16 +181,38 @@ def get_target_orders(xlsm_path):
         return set()
     ws = wb[sheet_name]
 
+    def _shipping_empty(v):
+        # ★2026/07/03修正: None/空文字だけでなく 0・空白文字列・数式の空結果も「未記入」扱い
+        if v is None:
+            return True
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        try:
+            if float(v) == 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return False
+
+    order_rows = []
     last_filled_row = 1
     for row in range(2, ws.max_row + 1):
         val = ws.cell(row=row, column=2).value
         if not val or not isinstance(val, str) or not order_pattern.match(val.strip()):
             continue
+        order_rows.append(row)
         br_val = ws.cell(row=row, column=ship_col_idx).value
-        if br_val is not None and br_val != "":
+        if not _shipping_empty(br_val):
             last_filled_row = row
 
     print(f"  送料記入済み最終行: {last_filled_row}")
+
+    # ★診断ログ: 末尾15注文行の送料セル生値（誤認バグ調査用）
+    for row in order_rows[-15:]:
+        _v = ws.cell(row=row, column=ship_col_idx).value
+        _o = str(ws.cell(row=row, column=2).value).strip()
+        _e = str(ws.cell(row=row, column=5).value or "")[:8]
+        print(f"    [DEBUG] 行{row} {_o} {shipping_col}={_v!r} E={_e}")
 
     targets = set()
     for row in range(last_filled_row + 1, ws.max_row + 1):
@@ -201,7 +223,7 @@ def get_target_orders(xlsm_path):
         if "キャンセル" in str(e_val or ""):
             continue
         br_val = ws.cell(row=row, column=ship_col_idx).value
-        if br_val is None or br_val == "":
+        if _shipping_empty(br_val):
             targets.add(val.strip())
 
     wb.close()
