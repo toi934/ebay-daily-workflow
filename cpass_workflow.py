@@ -600,33 +600,80 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     if clicked_assign:
         time.sleep(3)
 
-        # 内側モーダル内のDHL価格を取得
-        dhl_price = page.evaluate(
+        # ★★★ 内側モーダル内のDHL「個別価格」を取得（2026/07/03 修正）★★★
+        # 旧実装はレンジ表示「X - Y JPY」の上限(Y)を返していたため全注文が同額(8995等)になっていた。
+        # 新実装: DHL行の「選択」をクリック→実計算価格（単一の「X,XXX JPY」）を優先取得。
+        modal_text = page.evaluate(
             """() => {
-                const all = Array.from(document.querySelectorAll('*'));
-                const dhlNodes = all.filter(el => {
-                    const t = (el.textContent || '');
-                    return t.toLowerCase().includes('dhl') && el.children.length === 0;
-                });
-                for (const node of dhlNodes) {
-                    let card = node;
-                    for (let i = 0; i < 8; i++) {
-                        card = card.parentElement;
-                        if (!card) break;
-                        const txt = card.textContent || '';
-                        const m = txt.match(/([\\d,]+)\\s*[-〜~–]\\s*([\\d,]+)\\s*JPY/);
-                        if (m) return parseInt(m[2].replace(/,/g, ''), 10);
-                        const m2 = txt.match(/([\\d,]+)\\s*JPY/);
-                        if (m2 && txt.toLowerCase().includes('dhl')) {
-                            return parseInt(m2[1].replace(/,/g, ''), 10);
-                        }
-                    }
-                }
-                return null;
+                const modal = document.querySelector('.ant-modal');
+                return modal ? (modal.innerText || '').slice(0, 1500) : null;
             }"""
         )
-        if dhl_price:
-            print("    DHL上限: " + str(dhl_price) + " JPY")
+        if modal_text:
+            print("    [DEBUG] 内側モーダル: " + modal_text.replace("\n", " | ")[:800])
+
+        picked = page.evaluate(
+            """() => {
+                const modal = document.querySelector('.ant-modal');
+                if (!modal) return false;
+                const rows = Array.from(modal.querySelectorAll('tr, .ant-list-item, .ant-card, [class*="item"], [class*="row"]'));
+                const dhlRows = rows.filter(r => (r.textContent || '').toLowerCase().includes('dhl'));
+                for (const row of dhlRows) {
+                    const btn = Array.from(row.querySelectorAll('button, a, [role="button"]'))
+                        .find(b => /^(選択|select)$/i.test((b.textContent || '').trim()) && b.offsetParent !== null);
+                    if (btn) { btn.click(); return true; }
+                }
+                for (const row of dhlRows) {
+                    const radio = row.querySelector('input[type="radio"]');
+                    if (radio && !radio.checked && radio.offsetParent !== null) { radio.click(); return true; }
+                }
+                return false;
+            }"""
+        )
+        if picked:
+            print("    [OK] DHL「選択」クリック")
+            time.sleep(2)
+
+        _price_result = page.evaluate(
+            """() => {
+                const rangeSrc = '([\\\\d,]+)\\\\s*[-〜~–]\\\\s*([\\\\d,]+)\\\\s*JPY';
+                function findPrice(root) {
+                    if (!root) return null;
+                    const all = Array.from(root.querySelectorAll('*'));
+                    const dhlNodes = all.filter(el => {
+                        const t = (el.textContent || '');
+                        return t.toLowerCase().includes('dhl') && el.children.length === 0;
+                    });
+                    for (const node of dhlNodes) {
+                        let card = node;
+                        for (let i = 0; i < 8; i++) {
+                            card = card.parentElement;
+                            if (!card) break;
+                            const txt = card.textContent || '';
+                            if (!txt.toLowerCase().includes('dhl')) continue;
+                            // レンジ表記を除去→残った単一価格＝実計算価格
+                            const cleaned = txt.replace(new RegExp(rangeSrc, 'g'), ' ');
+                            const singles = Array.from(cleaned.matchAll(/([\\d,]{3,})\\s*JPY/g))
+                                .map(m => parseInt(m[1].replace(/,/g, ''), 10)).filter(n => n >= 100);
+                            if (singles.length) return { price: singles[0], src: 'single' };
+                            const m = txt.match(new RegExp(rangeSrc));
+                            if (m) return { price: parseInt(m[2].replace(/,/g, ''), 10), src: 'range-max' };
+                        }
+                    }
+                    return null;
+                }
+                return findPrice(document.querySelector('.ant-modal'))
+                    || findPrice(document.querySelector('.ant-drawer-body'))
+                    || findPrice(document);
+            }"""
+        )
+        dhl_price = None
+        if _price_result and _price_result.get("price"):
+            dhl_price = _price_result["price"]
+            if _price_result.get("src") == "single":
+                print("    DHL個別価格: " + str(dhl_price) + " JPY")
+            else:
+                print("    [WARN] 個別価格が見つからずレンジ上限を使用: " + str(dhl_price) + " JPY")
         else:
             print("    DHL価格取得失敗（価格なしで保存を続行）")
 
