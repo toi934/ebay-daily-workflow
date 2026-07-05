@@ -642,7 +642,14 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                 pass
 
     if clicked_assign:
-        time.sleep(3)
+        # ★2026/07/05: 内側モーダルの出現を最大15秒待つ（従来は3秒固定）
+        try:
+            page.wait_for_selector('.ant-modal', state='visible', timeout=15000)
+            print("    内側モーダル出現 OK")
+        except Exception:
+            print("    [WARN] 内側モーダル(.ant-modal)が15秒以内に出現せず")
+        time.sleep(2)
+        _save_screenshot(page, "cpass_after_assign_ss.png")
 
         # ★★★ 内側モーダル内のDHL「個別価格」を取得（2026/07/03 修正）★★★
         # 旧実装はレンジ表示「X - Y JPY」の上限(Y)を返していたため全注文が同額(8995等)になっていた。
@@ -655,6 +662,17 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         )
         if modal_text:
             print("    [DEBUG] 内側モーダル: " + modal_text.replace("\n", " | ")[:800])
+        else:
+            # ★2026/07/05: モーダルが無い場合は画面全体のテキストをダンプ（原因調査用）
+            page_text = page.evaluate(
+                """() => {
+                    const dlg = document.querySelector('.ant-drawer-body')
+                        || document.querySelector('[role="dialog"]') || document.body;
+                    return (dlg.innerText || '').slice(0, 1200);
+                }"""
+            )
+            print("    [DEBUG] モーダルなし。画面テキスト: "
+                  + (page_text or "").replace("\n", " | ")[:1000])
 
         picked = page.evaluate(
             """() => {
