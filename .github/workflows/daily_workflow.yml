@@ -68,17 +68,7 @@ jobs:
           name: cpass-debug
           path: |
             cpass_action_ss.png
+            cpass_after_assign_ss.png
             cpass_processing_dump.html
             cpass_dhl_results.json
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Commit run count
-        if: steps.guard.outputs.run == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          TZ=Asia/Tokyo date +%F > last_run_date.txt
-          git add run_count_task2.txt last_run_date.txt || true
-          git diff --staged --quiet || git commit -m "Update run count task2"
-          git push || true
+          if-no-files-found: igno
