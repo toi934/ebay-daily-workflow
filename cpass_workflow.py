@@ -582,20 +582,64 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     print("  「配送を割り当て」クリック...")
     dhl_price = None
     clicked_assign = False
-    # ★ ダイアログ内に限定（ツールバーの btnAssignShipping を誤クリックしない）
-    for sel in [
-        '.ant-drawer-body button:has-text("配送を割り当て")',
-        '.ant-modal-content button:has-text("配送を割り当て")',
-        '[role="dialog"] button:has-text("配送を割り当て")',
-        'button:has-text("配送を割り当て"):not(#btnAssignShipping)',
-    ]:
-        try:
-            page.locator(sel).first.click(timeout=3000)
-            clicked_assign = True
-            print("    [OK] " + sel)
-            break
-        except Exception:
-            pass
+    # ★2026/07/05修正: 保存ボタンと同じJS座標クリック方式に変更
+    #   - button以外（a / [role=button] / span系）も対象
+    #   - テキストは「配送を割り当て」→「割り当て」→「assign」の順で緩めて検索
+    #   - ツールバーの #btnAssignShipping は除外（誤クリック防止）
+    rect_assign = page.evaluate(
+        """() => {
+            const texts = ['配送を割り当て', '割り当て', 'assign'];
+            const containers = [
+                document.querySelector('.ant-drawer-body'),
+                document.querySelector('.ant-modal-content'),
+                document.querySelector('[role="dialog"]'),
+                document.body
+            ].filter(Boolean);
+            for (const t of texts) {
+                for (const container of containers) {
+                    const cands = Array.from(container.querySelectorAll(
+                        'button, a, [role="button"], span[class*="btn"], div[class*="btn"]'
+                    )).filter(el => {
+                        if (el.id === 'btnAssignShipping') return false;
+                        if (el.closest('#btnAssignShipping')) return false;
+                        if (el.offsetParent === null) return false;
+                        const txt = (el.textContent || '').trim();
+                        if (!txt || txt.length > 30) return false;
+                        return txt.toLowerCase().includes(t.toLowerCase());
+                    });
+                    if (cands.length) {
+                        const el = cands[0];
+                        el.scrollIntoView({block: 'center'});
+                        const r = el.getBoundingClientRect();
+                        return {x: r.left + r.width / 2, y: r.top + r.height / 2,
+                                txt: (el.textContent || '').trim(),
+                                tag: el.tagName, matched: t};
+                    }
+                }
+            }
+            return null;
+        }"""
+    )
+    if rect_assign and rect_assign.get('x'):
+        page.mouse.click(rect_assign['x'], rect_assign['y'])
+        clicked_assign = True
+        print("    [OK] JS座標クリック: <" + str(rect_assign.get('tag')) + "> '"
+              + str(rect_assign.get('txt')) + "' (match=" + str(rect_assign.get('matched')) + ")")
+    else:
+        # fallback: 従来のlocator方式
+        for sel in [
+            '.ant-drawer-body button:has-text("配送を割り当て")',
+            '.ant-modal-content button:has-text("配送を割り当て")',
+            '[role="dialog"] button:has-text("配送を割り当て")',
+            'button:has-text("配送を割り当て"):not(#btnAssignShipping)',
+        ]:
+            try:
+                page.locator(sel).first.click(timeout=3000)
+                clicked_assign = True
+                print("    [OK] " + sel)
+                break
+            except Exception:
+                pass
 
     if clicked_assign:
         time.sleep(3)
@@ -712,6 +756,25 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             time.sleep(1.5)
     else:
         print("    警告: 「配送を割り当て」ボタンが見つかりません")
+        # ★2026/07/05追加: 原因調査用にダイアログ内の全クリック要素をログ出力
+        try:
+            dbg = page.evaluate(
+                """() => {
+                    const dlg = document.querySelector('.ant-drawer-body')
+                        || document.querySelector('.ant-modal-content')
+                        || document.querySelector('[role="dialog"]')
+                        || document.body;
+                    return Array.from(dlg.querySelectorAll('button, a, [role="button"]'))
+                        .filter(el => el.offsetParent !== null)
+                        .map(el => el.tagName + ':' + (el.textContent || '').trim().slice(0, 20))
+                        .filter(t => t.split(':')[1])
+                        .slice(0, 60);
+                }"""
+            )
+            print("    [DEBUG] ダイアログ内クリック要素一覧: "
+                  + json.dumps(dbg, ensure_ascii=False)[:1500])
+        except Exception as e:
+            print("    [DEBUG] 要素一覧取得失敗: " + str(e)[:60])
         _save_screenshot(page, "cpass_action_ss.png")
 
     # 3. 「保存する」ボタンを座標クリック（ダイアログ内を優先）
