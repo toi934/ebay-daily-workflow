@@ -60,6 +60,19 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python daily_workflow_ga.py
 
+      # ★2026/07/05追加: 調査用にスクリーンショット等をArtifactsへ保存（失敗時も）
+      - name: Upload debug artifacts
+        if: always() && steps.guard.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpass-debug
+          path: |
+            cpass_action_ss.png
+            cpass_processing_dump.html
+            cpass_dhl_results.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Commit run count
         if: steps.guard.outputs.run == 'true'
         run: |
