@@ -642,12 +642,20 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                 pass
 
     if clicked_assign:
-        # ★2026/07/05: 内側モーダルの出現を最大15秒待つ（従来は3秒固定）
+        # ★2026/07/05v2: 割り当てパネルの出現を待つ（.ant-modal または DHL行「選択」ボタン）
+        panel_js = """() => {
+            if (document.querySelector('.ant-modal')) return true;
+            const cands = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                .filter(el => /^(選択|select)$/i.test((el.textContent || '').trim())
+                    && el.offsetParent !== null);
+            return cands.length > 0
+                || (document.body.innerText || '').includes('Friendly Reminder');
+        }"""
         try:
-            page.wait_for_selector('.ant-modal', state='visible', timeout=15000)
-            print("    内側モーダル出現 OK")
+            page.wait_for_function(panel_js, timeout=15000)
+            print("    割り当てパネル出現 OK")
         except Exception:
-            print("    [WARN] 内側モーダル(.ant-modal)が15秒以内に出現せず")
+            print("    [WARN] 割り当てパネルが15秒以内に出現せず")
         time.sleep(2)
         _save_screenshot(page, "cpass_after_assign_ss.png")
 
@@ -674,30 +682,39 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             print("    [DEBUG] モーダルなし。画面テキスト: "
                   + (page_text or "").replace("\n", " | ")[:1000])
 
-        picked = page.evaluate(
-            """() => {
-                const modal = document.querySelector('.ant-modal');
-                if (!modal) return false;
-                const rows = Array.from(modal.querySelectorAll('tr, .ant-list-item, .ant-card, [class*="item"], [class*="row"]'));
-                const dhlRows = rows.filter(r => (r.textContent || '').toLowerCase().includes('dhl'));
+        # ★2026/07/05v2: DHL「選択」をページ全体から検索（.ant-modal限定を廃止）＋最大18秒ポーリング
+        pick_js = """() => {
+            const roots = [document.querySelector('.ant-modal'), document].filter(Boolean);
+            for (const root of roots) {
+                const rows = Array.from(root.querySelectorAll(
+                    'tr, .ant-list-item, .ant-card, [class*="item"], [class*="row"], [class*="card"], li'));
+                const dhlRows = rows.filter(r => (r.textContent || '').toLowerCase().includes('dhl')
+                    && (r.textContent || '').length < 1200);
                 for (const row of dhlRows) {
                     const btn = Array.from(row.querySelectorAll('button, a, [role="button"]'))
                         .find(b => /^(選択|select)$/i.test((b.textContent || '').trim()) && b.offsetParent !== null);
-                    if (btn) { btn.click(); return true; }
+                    if (btn) { btn.scrollIntoView({block: 'center'}); btn.click(); return true; }
                 }
                 for (const row of dhlRows) {
                     const radio = row.querySelector('input[type="radio"]');
                     if (radio && !radio.checked && radio.offsetParent !== null) { radio.click(); return true; }
                 }
-                return false;
-            }"""
-        )
+            }
+            return false;
+        }"""
+        picked = False
+        _deadline = time.time() + 18
+        while time.time() < _deadline and not picked:
+            picked = page.evaluate(pick_js)
+            if not picked:
+                time.sleep(1.5)
         if picked:
             print("    [OK] DHL「選択」クリック")
             time.sleep(2)
+        else:
+            print("    [WARN] DHL「選択」ボタンが見つかりません")
 
-        _price_result = page.evaluate(
-            """() => {
+        _price_js = """() => {
                 const rangeSrc = '([\\\\d,]+)\\\\s*[-〜~–]\\\\s*([\\\\d,]+)\\\\s*JPY';
                 function findPrice(root) {
                     if (!root) return null;
@@ -728,7 +745,14 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                     || findPrice(document.querySelector('.ant-drawer-body'))
                     || findPrice(document);
             }"""
-        )
+        # ★2026/07/05v2: 価格が非同期計算されるため最大12秒ポーリング
+        _price_result = None
+        _deadline2 = time.time() + 12
+        while time.time() < _deadline2:
+            _price_result = page.evaluate(_price_js)
+            if _price_result and _price_result.get("price"):
+                break
+            time.sleep(1.5)
         dhl_price = None
         if _price_result and _price_result.get("price"):
             dhl_price = _price_result["price"]
