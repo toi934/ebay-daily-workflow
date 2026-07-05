@@ -578,6 +578,45 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     print("    入力結果: " + json.dumps(filled, ensure_ascii=False))
     time.sleep(1)
 
+    # ★2026/07/05v3: 入力後の実値を読み戻して検証（Reactが値を戻していないか確認）
+    try:
+        verify = page.evaluate(
+            """() => {
+                function findInputNear(labelText) {
+                    const labels = Array.from(document.querySelectorAll('*'))
+                        .filter(el => {
+                            const t = (el.textContent || '').trim();
+                            return t.startsWith(labelText) && el.children.length === 0;
+                        });
+                    for (const lbl of labels) {
+                        let parent = lbl;
+                        for (let i = 0; i < 5; i++) {
+                            parent = parent.parentElement;
+                            if (!parent) break;
+                            const inp = parent.querySelector('input[type="text"], input[type="number"]');
+                            if (inp) return inp;
+                        }
+                        let next = lbl.nextElementSibling;
+                        while (next) {
+                            const inp = next.querySelector('input');
+                            if (inp) return inp;
+                            next = next.nextElementSibling;
+                        }
+                    }
+                    return null;
+                }
+                const out = {};
+                for (const lbl of ['梱包', '長さ', '幅', '高さ', 'HSコード']) {
+                    const inp = findInputNear(lbl);
+                    out[lbl] = inp ? inp.value : null;
+                }
+                return out;
+            }"""
+        )
+        print("    [DEBUG] 入力後の実値: " + json.dumps(verify, ensure_ascii=False))
+    except Exception as e:
+        print("    [DEBUG] 実値検証失敗: " + str(e)[:60])
+
     # 2. 「配送を割り当て」クリック → 内側モーダルが開く → DHL「選択」→価格取得
     print("  「配送を割り当て」クリック...")
     dhl_price = None
@@ -607,11 +646,15 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                         if (!txt || txt.length > 30) return false;
                         return txt.toLowerCase().includes(t.toLowerCase());
                     });
-                    if (cands.length) {
-                        const el = cands[0];
+                    for (const el of cands) {
                         el.scrollIntoView({block: 'center'});
                         const r = el.getBoundingClientRect();
-                        return {x: r.left + r.width / 2, y: r.top + r.height / 2,
+                        if (!r.width || !r.height) continue;
+                        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                        const hit = document.elementFromPoint(cx, cy);
+                        // ★前面に別要素（ダイアログのオーバーレイ等）が被っている候補は除外
+                        if (!hit || !(el.contains(hit) || hit.contains(el))) continue;
+                        return {x: cx, y: cy,
                                 txt: (el.textContent || '').trim(),
                                 tag: el.tagName, matched: t};
                     }
@@ -674,9 +717,9 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             # ★2026/07/05: モーダルが無い場合は画面全体のテキストをダンプ（原因調査用）
             page_text = page.evaluate(
                 """() => {
-                    const dlg = document.querySelector('.ant-drawer-body')
-                        || document.querySelector('[role="dialog"]') || document.body;
-                    return (dlg.innerText || '').slice(0, 1200);
+                    const t = document.body.innerText || '';
+                    const i = t.indexOf('配送概要');
+                    return t.slice(Math.max(0, i), Math.max(0, i) + 1800);
                 }"""
             )
             print("    [DEBUG] モーダルなし。画面テキスト: "
