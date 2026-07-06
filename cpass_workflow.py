@@ -419,6 +419,28 @@ def _open_detail_dialog(page, order_no):
 
     if btn_index < 0:
         print("    ボタンが見つかりません → スキップ")
+        # ★2026/07/06追加: なぜ見つからないか原因調査用に該当行のボタン一覧をダンプ
+        try:
+            dbg_row = page.evaluate(
+                """(orderNo) => {
+                    const wrappers = Array.from(document.querySelectorAll('.pkg_wrapper'));
+                    for (const w of wrappers) {
+                        const val = w.querySelector('.order_num .value');
+                        if (val && (val.textContent || '').trim() === orderNo) {
+                            return Array.from(w.querySelectorAll('button'))
+                                .map(b => (b.textContent || '').trim().slice(0, 20));
+                        }
+                    }
+                    return null;
+                }""",
+                order_no,
+            )
+            if dbg_row is None:
+                print("    [DEBUG] この注文番号自体が発送手続きタブに存在しません（.pkg_wrapper未検出）")
+            else:
+                print("    [DEBUG] 該当行のボタン一覧: " + json.dumps(dbg_row, ensure_ascii=False))
+        except Exception as e:
+            print("    [DEBUG] 行ボタン一覧取得失敗: " + str(e)[:60])
         _save_screenshot(page, "cpass_action_ss.png")
         return False
 
@@ -489,6 +511,56 @@ def _save_screenshot(page, filename):
         print("    スクリーンショット保存: " + ss_path)
     except Exception as e:
         print("    スクリーンショット失敗: " + str(e)[:60])
+
+
+def _close_all_dialogs(page, max_attempts=4):
+    """開いている全てのダイアログ/モーダル/ドロワーを強制的に閉じる
+
+    ★2026/07/06追加: 前の注文の外側編集ダイアログが「保存する」後も閉じきらずに
+    残ってしまうと、次の注文の編集ボタンをクリックした際に
+    「もう開いている（＝前注文のダイアログ）」を誤って「開けた」と判定し、
+    2件目以降のDHL取得が軒並み失敗する不具合が起きうる（2026/07/06 9件中2件のみ成功で発覚）。
+    保存直後 と 次注文の編集ボタンを押す直前 の両方で呼び出し、
+    ダイアログ系コンテナが画面上に一切残っていないことを確認してから次に進む。
+    """
+    for attempt in range(max_attempts):
+        clicked = page.evaluate(
+            """() => {
+                let clicked = false;
+                const closeTexts = ['閉じる', 'Close', 'キャンセル', 'Cancel'];
+                const btns = Array.from(document.querySelectorAll(
+                    'button, [role="button"], .ant-drawer-close, .ant-modal-close'
+                ));
+                for (const b of btns) {
+                    if (b.offsetParent === null) continue;
+                    const txt = (b.textContent || '').trim();
+                    const isCloseBtn = closeTexts.includes(txt)
+                        || b.classList.contains('ant-drawer-close')
+                        || b.classList.contains('ant-modal-close')
+                        || b.getAttribute('aria-label') === 'Close';
+                    if (isCloseBtn) { b.click(); clicked = true; }
+                }
+                return clicked;
+            }"""
+        )
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        time.sleep(0.8)
+        still_open = page.evaluate(
+            """() => !!(document.querySelector('.ant-drawer-content')
+                || document.querySelector('.ant-modal-content')
+                || document.querySelector('[role="dialog"]'))"""
+        )
+        if not still_open:
+            if attempt > 0:
+                print("    [OK] 残存ダイアログを" + str(attempt + 1) + "回目のクローズ試行で解消")
+            return True
+        if not clicked:
+            break
+    print("    [WARN] 残存ダイアログが閉じきれていません（次の注文で誤検知の恐れあり）")
+    return False
 
 
 def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs_code):
@@ -909,6 +981,11 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         print("    警告: 保存ボタンが見つかりません")
         _save_screenshot(page, "cpass_action_ss.png")
     time.sleep(2)
+
+    # ★2026/07/06追加: 保存後に外側の編集ダイアログが残っていないか確認・強制クローズ
+    # → 残ったままだと次の注文で「もう開いている」と誤認識され以降の注文が軒並み失敗するため
+    _close_all_dialogs(page)
+
     return saved, dhl_price
 
 
@@ -1022,6 +1099,13 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
             # 対象フィルタ
             if target_order_nos is not None:
                 target_set = set(target_order_nos)
+                # ★2026/07/06追加: 対象注文のうちCPaSS「発送手続き」タブに
+                # そもそも存在しないものを明示的にログ出力（原因切り分け用）
+                found_set = set(o["order_no"] for o in orders)
+                missing = target_set - found_set
+                if missing:
+                    print("  [WARN] 対象注文のうちCPaSS発送手続きタブで見つからないもの("
+                          + str(len(missing)) + "件): " + ", ".join(sorted(missing)))
                 orders = [o for o in orders if o["order_no"] in target_set]
                 print("  対象絞り込み後: " + str(len(orders)) + " 件")
 
@@ -1037,16 +1121,10 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                 hs_code = hs_code_lookup.lookup_hs_code(order.get("title", ""))
                 print("  推定: " + dims["category"] + " / HS=" + hs_code)
 
-                # ★ 前の注文の残存内側モーダルを閉じる
-                # （編集ダイアログを開く前に実行することで、開いたダイアログを誤閉じしない）
-                page.evaluate(
-                    """() => {
-                        const btns = Array.from(document.querySelectorAll('button'));
-                        btns.filter(b => (b.textContent||'').trim() === '閉じる' && b.offsetParent !== null)
-                            .forEach(b => b.click());
-                    }"""
-                )
-                time.sleep(0.5)
+                # ★ 前の注文の残存ダイアログ（外側編集ダイアログ含む）を確実に閉じる
+                # ★2026/07/06: ここが不十分だと次注文の編集ボタンクリック後に
+                #   前注文のダイアログをそのまま「開けた」と誤判定してしまう
+                _close_all_dialogs(page)
 
                 # ★「発送手続き」タブで「詳細を見る」からダイアログを開く
                 if not _open_edit_dialog(page, order["order_no"]):
