@@ -413,6 +413,63 @@ def _dismiss_copyright_dialog(page):
     return False
 
 
+def _find_order_page(page, order_no, max_pages=20):
+    """「発送手続き」タブでorder_noが載っているページまでめくって移動する。
+
+    ★2026/07/09追加・重大バグ修正:
+    _scrape_all_orders_with_pagination で全ページ分の注文一覧は正しく取得できる
+    ようになったが、_open_detail_dialog 側は「今ブラウザに表示されているページ」
+    の .pkg_wrapper しか見ておらず、全ページ巡回が終わった時点でブラウザは
+    最後のページ（例:3ページ目）に取り残されたままだった。そのため対象注文が
+    1・2ページ目にある場合は毎回「この注文番号自体が発送手続きタブに存在しません」
+    となり、DHL価格取得が0件になっていた（2026/07/09 戸井さん報告・run#46で確認）。
+    ここで改めて先頭ページから探し直し、見つかったページに留まってから
+    編集ボタンを探す。
+    """
+    _navigate_to_sidebar_tab(page, "発送手続き")
+    for page_idx in range(1, max_pages + 1):
+        found = page.evaluate(
+            """(orderNo) => {
+                const wrappers = document.querySelectorAll('.pkg_wrapper');
+                for (const w of wrappers) {
+                    const val = w.querySelector('.order_num .value');
+                    if (val && (val.textContent || '').trim() === orderNo) return true;
+                }
+                return false;
+            }""",
+            order_no,
+        )
+        if found:
+            print("    [OK] order=" + order_no + " はページ" + str(page_idx) + "で発見")
+            return True
+        has_next = False
+        try:
+            has_next = page.evaluate(
+                """() => {
+                    const next = document.querySelector('.ant-pagination-next');
+                    if (!next) return false;
+                    return next.getAttribute('aria-disabled') !== 'true'
+                        && !next.classList.contains('ant-pagination-disabled');
+                }"""
+            )
+        except Exception:
+            pass
+        if not has_next:
+            break
+        try:
+            page.evaluate("""() => { document.querySelector('.ant-pagination-next').click(); }""")
+        except Exception:
+            break
+        time.sleep(2)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        time.sleep(1)
+    print("    [DEBUG] 全ページを探索してもorder=" + order_no + " が見つかりません")
+    return False
+
+
 def _open_detail_dialog(page, order_no):
     """指定の order_no の「編集」ボタンをクリックしてダイアログを開く
 
@@ -420,6 +477,11 @@ def _open_detail_dialog(page, order_no):
     """
     # 著作権ダイアログを先に閉じる
     _dismiss_copyright_dialog(page)
+
+    # ★2026/07/09追加: 編集ボタンを探す前に、対象注文が載っているページまで移動する
+    if not _find_order_page(page, order_no):
+        _save_screenshot(page, "cpass_action_ss.png")
+        return False
 
     # 残ダイアログを閉じる
     for sel in ['button:has-text("閉じる")', 'button:has-text("Close")', '[aria-label="Close"]']:
