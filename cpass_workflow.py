@@ -942,45 +942,64 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         else:
             print("    [WARN] DHL「選択」ボタンが見つかりません")
 
-        _price_js = """() => {
-                const rangeSrc = '([\\\\d,]+)\\\\s*[-〜~–]\\\\s*([\\\\d,]+)\\\\s*JPY';
-                function findPrice(root) {
-                    if (!root) return null;
-                    const all = Array.from(root.querySelectorAll('*'));
-                    const dhlNodes = all.filter(el => {
-                        const t = (el.textContent || '');
-                        return t.toLowerCase().includes('dhl') && el.children.length === 0;
-                    });
-                    for (const node of dhlNodes) {
-                        let card = node;
-                        for (let i = 0; i < 8; i++) {
-                            card = card.parentElement;
-                            if (!card) break;
-                            const txt = card.textContent || '';
-                            if (!txt.toLowerCase().includes('dhl')) continue;
-                            // レンジ表記を除去→残った単一価格＝実計算価格
-                            const cleaned = txt.replace(new RegExp(rangeSrc, 'g'), ' ');
-                            const singles = Array.from(cleaned.matchAll(/([\\d,]{3,})\\s*JPY/g))
-                                .map(m => parseInt(m[1].replace(/,/g, ''), 10)).filter(n => n >= 100);
-                            if (singles.length) return { price: singles[0], src: 'single' };
-                            const m = txt.match(new RegExp(rangeSrc));
-                            if (m) return { price: parseInt(m[2].replace(/,/g, ''), 10), src: 'range-max' };
-                        }
-                    }
-                    return null;
-                }
-                return findPrice(document.querySelector('.ant-modal'))
-                    || findPrice(document.querySelector('.ant-drawer-body'))
-                    || findPrice(document);
-            }"""
-        # ★2026/07/05v2: 価格が非同期計算されるため最大12秒ポーリング
+        # ★2026/07/09 重大バグ修正:
+        # 旧実装は「選択」ボタンが見つからない/割り当てパネルが出ない場合でも
+        # document全体からdhlを含む要素を検索するフォールバックを実行していた。
+        # このフォールバックは要素の可視性（表示中かどうか）を一切見ておらず、
+        # 前の注文で開いたDHL価格パネルが閉じきらずDOM上に残っている（display:none等で
+        # 非表示だがquerySelectorAllには引っかかる）場合、そのまま前注文の価格を
+        # 拾ってしまい、複数注文が同一金額（例:全件10078円）になるバグが発生していた
+        # （2026/07/09 戸井さん報告・通常7/9・専門7/9ファイルで確認）。
+        # → 「選択」クリックに成功した場合、または本物の割り当てパネル(.ant-modal等)が
+        #   実際に出現した場合のみ価格検索を行う。それ以外は価格なし（None）のまま
+        #   保存し、後で戸井さんが手動確認できるよう空欄で残す方が安全。
         _price_result = None
-        _deadline2 = time.time() + 12
-        while time.time() < _deadline2:
-            _price_result = page.evaluate(_price_js)
-            if _price_result and _price_result.get("price"):
-                break
-            time.sleep(1.5)
+        if picked or modal_text:
+            _price_js = """() => {
+                    const rangeSrc = '([\\\\d,]+)\\\\s*[-〜~–]\\\\s*([\\\\d,]+)\\\\s*JPY';
+                    function isVisible(el) {
+                        return !!(el && el.offsetParent !== null);
+                    }
+                    function findPrice(root) {
+                        if (!root) return null;
+                        const all = Array.from(root.querySelectorAll('*'));
+                        const dhlNodes = all.filter(el => {
+                            const t = (el.textContent || '');
+                            return t.toLowerCase().includes('dhl') && el.children.length === 0
+                                && isVisible(el);
+                        });
+                        for (const node of dhlNodes) {
+                            let card = node;
+                            for (let i = 0; i < 8; i++) {
+                                card = card.parentElement;
+                                if (!card) break;
+                                if (!isVisible(card)) continue;
+                                const txt = card.textContent || '';
+                                if (!txt.toLowerCase().includes('dhl')) continue;
+                                // レンジ表記を除去→残った単一価格＝実計算価格
+                                const cleaned = txt.replace(new RegExp(rangeSrc, 'g'), ' ');
+                                const singles = Array.from(cleaned.matchAll(/([\\d,]{3,})\\s*JPY/g))
+                                    .map(m => parseInt(m[1].replace(/,/g, ''), 10)).filter(n => n >= 100);
+                                if (singles.length) return { price: singles[0], src: 'single' };
+                                const m = txt.match(new RegExp(rangeSrc));
+                                if (m) return { price: parseInt(m[2].replace(/,/g, ''), 10), src: 'range-max' };
+                            }
+                        }
+                        return null;
+                    }
+                    return findPrice(document.querySelector('.ant-modal'))
+                        || findPrice(document.querySelector('.ant-drawer-body'))
+                        || findPrice(document);
+                }"""
+            # ★2026/07/05v2: 価格が非同期計算されるため最大12秒ポーリング
+            _deadline2 = time.time() + 12
+            while time.time() < _deadline2:
+                _price_result = page.evaluate(_price_js)
+                if _price_result and _price_result.get("price"):
+                    break
+                time.sleep(1.5)
+        else:
+            print("    [WARN] 割り当てパネル未検出のため価格検索をスキップ（誤った価格の書き込み防止）")
         dhl_price = None
         if _price_result and _price_result.get("price"):
             dhl_price = _price_result["price"]
