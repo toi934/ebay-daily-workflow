@@ -147,6 +147,57 @@ def _scrape_orders_from_page(page):
     return extracted
 
 
+def _scrape_all_orders_with_pagination(page, max_pages=20):
+    """「発送手続き」タブの全ページを巡回して .pkg_wrapper を収集する
+
+    ★2026/07/09追加・重大バグ修正:
+    旧実装は _scrape_orders_from_page を1回呼ぶだけで、Ant Design の
+    ページネーション（.ant-pagination、1ページ100件・2ページ目以降あり）を
+    一切考慮していなかった。「発送手続き」タブに233件溜まっている状態で
+    1ページ目の100件しか読まず、新規注文の大半（12件中11件）が
+    「対象注文のうちCPaSS発送手続きタブで見つからないもの」として
+    毎回スキップされ、DHL価格取得・BL/BR記入がほぼ0件になっていた
+    （2026/07/09 戸井さん報告で発覚）。
+    """
+    all_orders = {}
+    for page_idx in range(1, max_pages + 1):
+        page_orders = _scrape_orders_from_page(page)
+        for o in page_orders:
+            all_orders[o["order_no"]] = o
+        total_text = None
+        has_next = False
+        try:
+            total_text = page.evaluate(
+                """() => { const el = document.querySelector('.ant-pagination-total-text'); return el ? el.textContent : null; }"""
+            )
+            has_next = page.evaluate(
+                """() => {
+                    const next = document.querySelector('.ant-pagination-next');
+                    if (!next) return false;
+                    return next.getAttribute('aria-disabled') !== 'true'
+                        && !next.classList.contains('ant-pagination-disabled');
+                }"""
+            )
+        except Exception as e:
+            print("    [WARN] ページネーション検出失敗: " + str(e)[:60])
+        print("    [ページ" + str(page_idx) + "] " + str(len(page_orders)) + "件 (累計"
+              + str(len(all_orders)) + "件" + (" / 全" + str(total_text) if total_text else "") + ")")
+        if not has_next:
+            break
+        try:
+            page.evaluate("""() => { document.querySelector('.ant-pagination-next').click(); }""")
+        except Exception as e:
+            print("    [WARN] 次ページクリック失敗: " + str(e)[:60])
+            break
+        time.sleep(2)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        time.sleep(1)
+    return list(all_orders.values())
+
+
 def _navigate_to_sidebar_tab(page, tab_label):
     """指定タブへ移動（直接URL goto を使用 → 確実）
 
@@ -1093,8 +1144,9 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
             except Exception:
                 pass
 
-            orders = _scrape_orders_from_page(page)
-            print("  発送手続き 件数: " + str(len(orders)))
+            # ★2026/07/09修正: 1ページ目だけでなく全ページを巡回して収集する
+            orders = _scrape_all_orders_with_pagination(page)
+            print("  発送手続き 件数(全ページ合計): " + str(len(orders)))
 
             # 対象フィルタ
             if target_order_nos is not None:

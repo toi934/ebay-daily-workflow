@@ -404,7 +404,10 @@ def main():
 
         # Step 3: CPaSS処理
         cpass_results = {}
-        if target_order_nos and not dry_run:
+        # ★2026/07/09修正: 対象0件でも「発送手続き待ち→発送手続き」への移動は必ず実行する。
+        # 旧コードは target_order_nos が空だとCPaSS処理自体を丸ごとスキップしており、
+        # 物理的な出荷キューが「発送手続き待ち」に滞留し続ける原因になっていた。
+        if not dry_run:
             print()
             print("=" * 60)
             print("Step 2: CPaSS ワークフロー実行")
