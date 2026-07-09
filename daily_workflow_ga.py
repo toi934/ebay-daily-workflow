@@ -96,15 +96,42 @@ def _download_xlsm(service, file_id, dest_path):
 
 
 def _upload_xlsm(service, file_id, src_path):
-    """Google Driveの既存ファイルを上書きUL"""
+    """Google Driveの既存ファイルを上書きUL
+
+    ★2026/07/09追加・バグ修正:
+    通常_7月9日_9時_売上管理表.xlsm のアップロードで
+    `EOF occurred in violation of protocol (_ssl.c:2427)` という一過性SSLエラーが
+    2回連続で発生し、CPaSSで取得済みのDHL送料8件がGoogle Driveに反映されない
+    問題が起きていた（openpyxlでのローカル書き込み・保存自体は成功していた）。
+    旧実装は resumable=False で1回のHTTPリクエストにファイル全体を乗せていたため、
+    途中で接続が切れると丸ごと失敗し、リトライも一切行っていなかった。
+    → resumable=True（チャンク分割アップロード）に変更し、さらに外側で
+      最大3回・指数バックオフ付きリトライを行うようにした。
+    """
     from googleapiclient.http import MediaFileUpload
-    media = MediaFileUpload(
-        src_path,
-        mimetype="application/vnd.ms-excel.sheet.macroEnabled.12",
-        resumable=False
-    )
-    service.files().update(fileId=file_id, media_body=media).execute()
-    print(f"  Google Driveにアップロード完了: {os.path.basename(src_path)}")
+
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            media = MediaFileUpload(
+                src_path,
+                mimetype="application/vnd.ms-excel.sheet.macroEnabled.12",
+                resumable=True,
+            )
+            request = service.files().update(fileId=file_id, media_body=media)
+            response = None
+            while response is None:
+                _, response = request.next_chunk()
+            print(f"  Google Driveにアップロード完了: {os.path.basename(src_path)}"
+                  + (f"（試行{attempt}回目で成功）" if attempt > 1 else ""))
+            return
+        except Exception as e:
+            last_err = e
+            print(f"  [WARN] Google Driveアップロード失敗(試行{attempt}/3): {str(e)[:150]}")
+            if attempt < 3:
+                time.sleep(5 * attempt)
+    print(f"  [ERROR] Google Driveアップロード 3回とも失敗: {os.path.basename(src_path)}")
+    raise last_err
 
 
 def download_xlsm_files(workdir):
