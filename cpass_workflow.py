@@ -738,9 +738,15 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             const results = {};
 
             // 梱包重量（配送概要セクションの「梱包」入力欄）
-            // ※「単位重量」はeBayから引き継がれるので触らない
             const wInput = findInputNear('梱包');
             results.weight = setValue(wInput, args.weight);
+
+            // 単位重量（アイテムリストの「単位重量(kg)」入力欄）
+            // ★2026/07/10確定: eBay継承値が0のままだとDHL価格パネルが無限ロードして
+            //   「選択」ボタンが出てこないバグが判明（run#45〜#51で対象11件が該当・戸井さん指示）
+            //   → Google検索ベースの推定重量(weight_kg)で明示的に上書きする。重量(Net)欄は触らない
+            const uInput = findInputNear('単位重量');
+            results.unit_weight = setValue(uInput, args.weight);
 
             // 長さ・幅・高さ
             const lInput = findInputNear('長さ');
@@ -791,7 +797,7 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                     return null;
                 }
                 const out = {};
-                for (const lbl of ['梱包', '長さ', '幅', '高さ', 'HSコード']) {
+                for (const lbl of ['梱包', '単位重量', '長さ', '幅', '高さ', 'HSコード']) {
                     const inp = findInputNear(lbl);
                     out[lbl] = inp ? inp.value : null;
                 }
