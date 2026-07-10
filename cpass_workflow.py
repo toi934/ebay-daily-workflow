@@ -702,6 +702,14 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     filled = page.evaluate(
         """(args) => {
             // ヘルパー: label/前のテキストから input を見つける
+            // ★2026/07/10確定バグ修正: input[type="text"/"number"]に限定すると、
+            //   AntDのInputNumber(単位重量/梱包/長さ/幅/高さ)はtype属性が無く、
+            //   AntDのSelect検索欄(HSコード/原産国)はtype="search"のため、
+            //   どちらもここで拾えず5階層上まで探索が続き、結果として
+            //   「告知のための商品名(英語)」等の無関係な最初のinput[type=text]を誤って
+            //   掴んでいた（単位重量とHSコードが同一要素を指し、書き込みが競合していた）。
+            //   型を限定せず「最初に見つかったinput/textarea」を返す方式に変更し、
+            //   各ラベルに最も近い正しい入力欄だけを拾うようにした。
             function findInputNear(labelText) {
                 const labels = Array.from(document.querySelectorAll('*'))
                     .filter(el => {
@@ -710,10 +718,10 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                     });
                 for (const lbl of labels) {
                     let parent = lbl;
-                    for (let i = 0; i < 5; i++) {
+                    for (let i = 0; i < 6; i++) {
                         parent = parent.parentElement;
                         if (!parent) break;
-                        const inp = parent.querySelector('input[type="text"], input[type="number"]');
+                        const inp = parent.querySelector('input, textarea');
                         if (inp) return inp;
                     }
                     // 次の兄弟要素から探す
@@ -728,8 +736,10 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             }
             function setValue(input, value) {
                 if (!input) return false;
-                const nativeSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
+                const proto = input.tagName === 'TEXTAREA'
+                    ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+                const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
                 nativeSetter.call(input, String(value));
                 input.dispatchEvent(new Event('input', { bubbles: true }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -781,10 +791,10 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                         });
                     for (const lbl of labels) {
                         let parent = lbl;
-                        for (let i = 0; i < 5; i++) {
+                        for (let i = 0; i < 6; i++) {
                             parent = parent.parentElement;
                             if (!parent) break;
-                            const inp = parent.querySelector('input[type="text"], input[type="number"]');
+                            const inp = parent.querySelector('input, textarea');
                             if (inp) return inp;
                         }
                         let next = lbl.nextElementSibling;
