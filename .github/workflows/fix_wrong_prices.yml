@@ -1,18 +1,37 @@
-name: 一時修正 誤送料クリア
+name: タスク2 誤データ修正（ワンオフ）
+
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true にすると書き込み・アップロードなしで対象件数のみ確認"
+        required: false
+        default: "false"
 
 jobs:
-  fix:
+  fix-wrong-prices:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install deps
-        run: pip install google-api-python-client google-auth openpyxl
+
+      - name: Install dependencies
+        run: |
+          pip install openpyxl google-auth google-api-python-client
+
       - name: Run fix script
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: python fix_wrong_prices_ga.py
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python fix_wrong_prices_ga.py --dry-run
+          else
+            python fix_wrong_prices_ga.py
+          fi
