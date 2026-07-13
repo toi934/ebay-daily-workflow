@@ -886,15 +886,31 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                 pass
 
     if clicked_assign:
-        # ★2026/07/05v2: 割り当てパネルの出現を待つ（.ant-modal または DHL行「選択」ボタン）
-        panel_js = """() => {
-            if (document.querySelector('.ant-modal')) return true;
-            const cands = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-                .filter(el => /^(選択|select)$/i.test((el.textContent || '').trim())
-                    && el.offsetParent !== null);
-            return cands.length > 0
-                || (document.body.innerText || '').includes('Friendly Reminder');
-        }"""
+        # ★2026/07/13確定バグ修正: CPaSSの「配送を割り当て」パネルが.ant-modalベースの
+        #   旧UIから、独自クラス(.sp-modal-dialog/.sp-modal-content)ベースの新UIに変わっていた。
+        #   実機調査（27-14854-47644で確認）の結果、DHL等の各配送業者は
+        #   .shipping_method > .shipping_service（サービス名）+ .action（「選 択」ボタン）
+        #   という構造になっており、旧セレクタ('.ant-modal'/.ant-card等)に一切マッチしないため
+        #   毎回「割り当てパネルが15秒以内に出現せず」「DHL「選択」ボタンが見つかりません」に
+        #   なっていた（DHL自体は選択可能な注文でも常に失敗していた）。
+        #   さらに「選択」ボタンの実テキストは「選 択」（間に半角スペース）で、
+        #   旧正規表現 /^(選択|select)$/i の完全一致にも失敗していた。
+        #   → 新UIのセレクタ(.sp-modal-content/.sp-modal-dialog/.shipping_method)を追加し、
+        #     ボタンテキストは空白除去してから比較するよう修正。
+        SP_MODAL_SEL = '.sp-modal-content, .sp-modal-dialog, .assign_shipping'
+        panel_js = (
+            """() => {
+                if (document.querySelector('""" + SP_MODAL_SEL + """')) return true;
+                if (document.querySelector('.ant-modal')) return true;
+                const cands = Array.from(document.querySelectorAll('button, a, [role="button"], .action'))
+                    .filter(el => {
+                        const t = (el.textContent || '').replace(/\\s+/g, '');
+                        return /^(選択|select)$/i.test(t) && el.offsetParent !== null;
+                    });
+                return cands.length > 0
+                    || (document.body.innerText || '').includes('Friendly Reminder');
+            }"""
+        )
         try:
             page.wait_for_function(panel_js, timeout=15000)
             print("    割り当てパネル出現 OK")
@@ -903,14 +919,15 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         time.sleep(2)
         _save_screenshot(page, "cpass_after_assign_ss.png")
 
-        # ★★★ 内側モーダル内のDHL「個別価格」を取得（2026/07/03 修正）★★★
+        # ★★★ 内側モーダル内のDHL「個別価格」を取得（2026/07/03 修正・2026/07/13新UI対応）★★★
         # 旧実装はレンジ表示「X - Y JPY」の上限(Y)を返していたため全注文が同額(8995等)になっていた。
         # 新実装: DHL行の「選択」をクリック→実計算価格（単一の「X,XXX JPY」）を優先取得。
         modal_text = page.evaluate(
-            """() => {
-                const modal = document.querySelector('.ant-modal');
+            """(sel) => {
+                const modal = document.querySelector(sel) || document.querySelector('.ant-modal');
                 return modal ? (modal.innerText || '').slice(0, 1500) : null;
-            }"""
+            }""",
+            SP_MODAL_SEL,
         )
         if modal_text:
             print("    [DEBUG] 内側モーダル: " + modal_text.replace("\n", " | ")[:800])
@@ -927,25 +944,34 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                   + (page_text or "").replace("\n", " | ")[:1000])
 
         # ★2026/07/05v2: DHL「選択」をページ全体から検索（.ant-modal限定を廃止）＋最大18秒ポーリング
-        pick_js = """() => {
-            const roots = [document.querySelector('.ant-modal'), document].filter(Boolean);
-            for (const root of roots) {
-                const rows = Array.from(root.querySelectorAll(
-                    'tr, .ant-list-item, .ant-card, [class*="item"], [class*="row"], [class*="card"], li'));
-                const dhlRows = rows.filter(r => (r.textContent || '').toLowerCase().includes('dhl')
-                    && (r.textContent || '').length < 1200);
-                for (const row of dhlRows) {
-                    const btn = Array.from(row.querySelectorAll('button, a, [role="button"]'))
-                        .find(b => /^(選択|select)$/i.test((b.textContent || '').trim()) && b.offsetParent !== null);
-                    if (btn) { btn.scrollIntoView({block: 'center'}); btn.click(); return true; }
+        # ★2026/07/13追加: 新UIの .shipping_method / .shipping_service を行候補に追加。
+        #   ボタンテキストの空白（「選 択」）を除去してから比較するよう修正。
+        pick_js = (
+            """() => {
+                const roots = [document.querySelector('""" + SP_MODAL_SEL + """'),
+                               document.querySelector('.ant-modal'), document].filter(Boolean);
+                for (const root of roots) {
+                    const rows = Array.from(root.querySelectorAll(
+                        'tr, .ant-list-item, .ant-card, .shipping_method, .shipping_service, '
+                        + '[class*="item"], [class*="row"], [class*="card"], [class*="shipping_method"], li'));
+                    const dhlRows = rows.filter(r => (r.textContent || '').toLowerCase().includes('dhl')
+                        && (r.textContent || '').length < 1200);
+                    for (const row of dhlRows) {
+                        const btn = Array.from(row.querySelectorAll('button, a, [role="button"], .action'))
+                            .find(b => {
+                                const t = (b.textContent || '').replace(/\\s+/g, '');
+                                return /^(選択|select)$/i.test(t) && b.offsetParent !== null;
+                            });
+                        if (btn) { btn.scrollIntoView({block: 'center'}); btn.click(); return true; }
+                    }
+                    for (const row of dhlRows) {
+                        const radio = row.querySelector('input[type="radio"]');
+                        if (radio && !radio.checked && radio.offsetParent !== null) { radio.click(); return true; }
+                    }
                 }
-                for (const row of dhlRows) {
-                    const radio = row.querySelector('input[type="radio"]');
-                    if (radio && !radio.checked && radio.offsetParent !== null) { radio.click(); return true; }
-                }
-            }
-            return false;
-        }"""
+                return false;
+            }"""
+        )
         picked = False
         _deadline = time.time() + 18
         while time.time() < _deadline and not picked:
@@ -971,7 +997,8 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         #   保存し、後で戸井さんが手動確認できるよう空欄で残す方が安全。
         _price_result = None
         if picked or modal_text:
-            _price_js = """() => {
+            _price_js = (
+                """() => {
                     const rangeSrc = '([\\\\d,]+)\\\\s*[-〜~–]\\\\s*([\\\\d,]+)\\\\s*JPY';
                     function isVisible(el) {
                         return !!(el && el.offsetParent !== null);
@@ -1003,10 +1030,12 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                         }
                         return null;
                     }
-                    return findPrice(document.querySelector('.ant-modal'))
+                    return findPrice(document.querySelector('""" + SP_MODAL_SEL + """'))
+                        || findPrice(document.querySelector('.ant-modal'))
                         || findPrice(document.querySelector('.ant-drawer-body'))
                         || findPrice(document);
                 }"""
+            )
             # ★2026/07/05v2: 価格が非同期計算されるため最大12秒ポーリング
             _deadline2 = time.time() + 12
             while time.time() < _deadline2:
@@ -1026,30 +1055,34 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         else:
             print("    DHL価格取得失敗（価格なしで保存を続行）")
 
-        # 内側モーダル（.ant-modal内）の「閉じる」ボタンを閉じる
-        # ★外側ダイアログの「閉じる」と区別するため .ant-modal 内のみを対象にする
+        # 内側モーダル（.ant-modal または新UIの.sp-modal-content）の「閉じる」ボタンを閉じる
+        # ★外側ダイアログの「閉じる」と区別するため内側モーダル内のみを対象にする
+        # ★2026/07/13追加: 新UI(.sp-modal-dialog/.sp-modal-content)にも対応
         print("  内側モーダルを閉じる...")
         closed = False
         rect2 = page.evaluate(
-            """() => {
-                // ant-modal 内の閉じるボタンを探す
-                const modal = document.querySelector('.ant-modal');
+            """(sel) => {
+                // 内側モーダル内の閉じるボタンを探す（新UI優先→旧.ant-modal）
+                const modal = document.querySelector(sel) || document.querySelector('.ant-modal');
                 if (modal) {
-                    const btns = Array.from(modal.querySelectorAll('button'));
+                    const btns = Array.from(modal.querySelectorAll('button, [role="button"], a'));
                     const btn = [...btns].reverse().find(b => (b.textContent||'').trim() === '閉じる' && b.offsetParent !== null);
                     if (btn) {
                         const r = btn.getBoundingClientRect();
                         return {x: r.left + r.width / 2, y: r.top + r.height / 2};
                     }
-                    // ×ボタン
-                    const closeBtn = modal.querySelector('.ant-modal-close');
+                    // ×ボタン（旧UI: .ant-modal-close / 新UI: sp-modal内の閉じるアイコン）
+                    const closeBtn = modal.querySelector('.ant-modal-close')
+                        || modal.querySelector('[class*="close"]')
+                        || (modal.closest('.sp-modal-dialog') || modal).querySelector('[class*="close"]');
                     if (closeBtn) {
                         const r = closeBtn.getBoundingClientRect();
                         return {x: r.left + r.width / 2, y: r.top + r.height / 2};
                     }
                 }
                 return null;
-            }"""
+            }""",
+            SP_MODAL_SEL,
         )
         if rect2 and rect2.get('x'):
             page.mouse.click(rect2['x'], rect2['y'])
