@@ -7,6 +7,11 @@ on:
     # 場合のみ本処理を実行する。それ以外は数秒で終了（publicリポジトリのため無料）。
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      verify_order_nos:
+        description: "検証用: 処理を限定する注文番号（カンマ区切り、空なら通常通り全件処理）"
+        required: false
+        default: ""
 
 concurrency:
   group: daily-workflow
@@ -58,6 +63,7 @@ jobs:
           CPASS_PASSWORD: ${{ secrets.CPASS_PASSWORD }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          VERIFY_ORDER_NOS: ${{ github.event.inputs.verify_order_nos }}
         run: python daily_workflow_ga.py
 
       # ★2026/07/05追加: 調査用にスクリーンショット等をArtifactsへ保存（失敗時も）
