@@ -922,12 +922,19 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         # ★★★ 内側モーダル内のDHL「個別価格」を取得（2026/07/03 修正・2026/07/13新UI対応）★★★
         # 旧実装はレンジ表示「X - Y JPY」の上限(Y)を返していたため全注文が同額(8995等)になっていた。
         # 新実装: DHL行の「選択」をクリック→実計算価格（単一の「X,XXX JPY」）を優先取得。
+        # ★2026/07/13再修正: SP_MODAL_SEL(.sp-modal-content/.sp-modal-dialog)はCPaSS内の
+        #   他の無関係なダイアログ（例:「差出人の住所編集」）とクラス名が衝突しており、
+        #   document.querySelector()がDOM順で先に出てくる無関係な方を掴んでしまうことが
+        #   実機調査（27-14854-47644）で確認された。.assign_shippingは実機調査で他要素と
+        #   衝突しない一意なクラスと確認済みのため、これを最優先で使う。
         modal_text = page.evaluate(
-            """(sel) => {
-                const modal = document.querySelector(sel) || document.querySelector('.ant-modal');
+            """() => {
+                const modal = document.querySelector('.assign_shipping')
+                    || document.querySelector('.sp-modal-content')
+                    || document.querySelector('.sp-modal-dialog')
+                    || document.querySelector('.ant-modal');
                 return modal ? (modal.innerText || '').slice(0, 1500) : null;
-            }""",
-            SP_MODAL_SEL,
+            }"""
         )
         if modal_text:
             print("    [DEBUG] 内側モーダル: " + modal_text.replace("\n", " | ")[:800])
@@ -948,7 +955,9 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         #   ボタンテキストの空白（「選 択」）を除去してから比較するよう修正。
         pick_js = (
             """() => {
-                const roots = [document.querySelector('""" + SP_MODAL_SEL + """'),
+                const roots = [document.querySelector('.assign_shipping'),
+                               document.querySelector('.sp-modal-content'),
+                               document.querySelector('.sp-modal-dialog'),
                                document.querySelector('.ant-modal'), document].filter(Boolean);
                 for (const root of roots) {
                     const rows = Array.from(root.querySelectorAll(
@@ -1030,10 +1039,25 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                         }
                         return null;
                     }
-                    return findPrice(document.querySelector('""" + SP_MODAL_SEL + """'))
-                        || findPrice(document.querySelector('.ant-modal'))
-                        || findPrice(document.querySelector('.ant-drawer-body'))
-                        || findPrice(document);
+                    // ★2026/07/13 二次修正（根本原因判明）:
+                    //   SP_MODAL_SEL('.sp-modal-content, .sp-modal-dialog, .assign_shipping')は
+                    //   CPaSS内の別の無関係なダイアログ（例:「差出人の住所編集」）と同じクラス名を
+                    //   共有しており、document.querySelector()はDOM順で最初に出てくる要素を返すため、
+                    //   実際のDHLパネルが開いていても無関係な方（DHLテキストなし）を掴んでしまい、
+                    //   findPriceが毎回nullを返してdocument全体フォールバックに落ちていた。
+                    //   document全体フォールバックはページ上の無関係な要素（別注文の情報等）を
+                    //   拾ってしまう危険があり、これが「全注文が同一の誤った価格(4687円)になる」
+                    //   バグの直接原因だった（run#74で確認）。
+                    //   → .assign_shippingは実機調査で他要素と衝突しない一意なクラスと確認済み
+                    //     なのでこれを最優先root候補にし、document全体へのフォールバックは廃止。
+                    //     .assign_shipping等の本物のパネルが見つからない場合は価格なし(null)の
+                    //     まま返す（誤った価格を書き込むより空欄の方が安全）。
+                    const panel = document.querySelector('.assign_shipping')
+                        || document.querySelector('.sp-modal-content')
+                        || document.querySelector('.sp-modal-dialog')
+                        || document.querySelector('.ant-modal')
+                        || document.querySelector('.ant-drawer-body');
+                    return findPrice(panel);
                 }"""
             )
             # ★2026/07/05v2: 価格が非同期計算されるため最大12秒ポーリング
@@ -1061,9 +1085,14 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         print("  内側モーダルを閉じる...")
         closed = False
         rect2 = page.evaluate(
-            """(sel) => {
+            """() => {
                 // 内側モーダル内の閉じるボタンを探す（新UI優先→旧.ant-modal）
-                const modal = document.querySelector(sel) || document.querySelector('.ant-modal');
+                // ★2026/07/13: sel(SP_MODAL_SEL)は他の無関係なダイアログとクラス名が衝突するため
+                //   .assign_shippingを最優先に変更（詳細は_price_js側のコメント参照）
+                const modal = document.querySelector('.assign_shipping')
+                    || document.querySelector('.sp-modal-content')
+                    || document.querySelector('.sp-modal-dialog')
+                    || document.querySelector('.ant-modal');
                 if (modal) {
                     const btns = Array.from(modal.querySelectorAll('button, [role="button"], a'));
                     const btn = [...btns].reverse().find(b => (b.textContent||'').trim() === '閉じる' && b.offsetParent !== null);
@@ -1081,8 +1110,7 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                     }
                 }
                 return null;
-            }""",
-            SP_MODAL_SEL,
+            }"""
         )
         if rect2 and rect2.get('x'):
             page.mouse.click(rect2['x'], rect2['y'])
