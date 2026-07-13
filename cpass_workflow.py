@@ -990,6 +990,26 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         if picked:
             print("    [OK] DHL「選択」クリック")
             time.sleep(2)
+            # ★2026/07/13 四次修正（実機調査で判明）: 「選択」をクリックすると内側の
+            #   .assign_shippingパネルは閉じてしまい、外側の詳細ダイアログの「配送概要」に
+            #   「見積もり」ボタンが表示される。このボタンを押さないと推定配送料は「-」の
+            #   ままで、確定した個別価格（.quote_line内）が表示されないことを
+            #   27-14854-47644で実機確認した（旧実装はこのステップが存在しなかった）。
+            _quote_rect = page.evaluate(
+                """() => {
+                    const btn = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                        .find(b => (b.textContent || '').trim() === '見積もり' && b.offsetParent !== null);
+                    if (!btn) return null;
+                    const r = btn.getBoundingClientRect();
+                    return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+                }"""
+            )
+            if _quote_rect and _quote_rect.get('x'):
+                page.mouse.click(_quote_rect['x'], _quote_rect['y'])
+                print("    [OK] 「見積もり」クリック")
+                time.sleep(2)
+            else:
+                print("    [WARN] 「見積もり」ボタンが見つかりません（価格が空欄になる可能性）")
         else:
             print("    [WARN] DHL「選択」ボタンが見つかりません")
 
@@ -1039,6 +1059,27 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                         }
                         return null;
                     }
+                    // ★2026/07/13 四次修正（実機調査で判明）:
+                    //   DHL「選択」クリック後は.assign_shippingパネルが閉じてしまい、
+                    //   代わりに外側ダイアログの「配送概要」セクション内の.quote_line要素に
+                    //   確定した個別価格（「推定配送料 XX,XXX JPY」）が表示される。
+                    //   「見積もり」ボタンをクリックした後はここが最も確実な取得元。
+                    //   DHL以外の別配送業者の.quote_lineを誤って拾わないよう、
+                    //   コンテナに「推定配送料」と「dhl」の両方が含まれる場合のみ採用する。
+                    function findQuoteLine() {
+                        const lines = Array.from(document.querySelectorAll('.quote_line')).filter(isVisible);
+                        for (const line of lines) {
+                            const container = line.closest('.left_carrier') || line.parentElement;
+                            const ctext = (container ? container.textContent : line.textContent) || '';
+                            if (!ctext.includes('推定配送料')) continue;
+                            if (!ctext.toLowerCase().includes('dhl')) continue;
+                            const cleaned = ctext.replace(new RegExp(rangeSrc, 'g'), ' ');
+                            const singles = Array.from(cleaned.matchAll(/([\\d,]{3,})\\s*JPY/g))
+                                .map(m => parseInt(m[1].replace(/,/g, ''), 10)).filter(n => n >= 100);
+                            if (singles.length) return { price: singles[0], src: 'quote_line' };
+                        }
+                        return null;
+                    }
                     // ★2026/07/13 二次修正（根本原因判明）:
                     //   SP_MODAL_SEL('.sp-modal-content, .sp-modal-dialog, .assign_shipping')は
                     //   CPaSS内の別の無関係なダイアログ（例:「差出人の住所編集」）と同じクラス名を
@@ -1057,7 +1098,7 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                         || document.querySelector('.sp-modal-dialog')
                         || document.querySelector('.ant-modal')
                         || document.querySelector('.ant-drawer-body');
-                    return findPrice(panel);
+                    return findQuoteLine() || findPrice(panel);
                 }"""
             )
             # ★2026/07/05v2: 価格が非同期計算されるため最大12秒ポーリング
@@ -1072,26 +1113,31 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         dhl_price = None
         if _price_result and _price_result.get("price"):
             dhl_price = _price_result["price"]
-            if _price_result.get("src") == "single":
-                print("    DHL個別価格: " + str(dhl_price) + " JPY")
+            if _price_result.get("src") in ("single", "quote_line"):
+                print("    DHL個別価格: " + str(dhl_price) + " JPY (src=" + str(_price_result.get("src")) + ")")
             else:
                 print("    [WARN] 個別価格が見つからずレンジ上限を使用: " + str(dhl_price) + " JPY")
         else:
             print("    DHL価格取得失敗（価格なしで保存を続行）")
 
-        # 内側モーダル（.ant-modal または新UIの.sp-modal-content）の「閉じる」ボタンを閉じる
+        # 内側モーダル（.ant-modal または新UIの.assign_shipping）の「閉じる」ボタンを閉じる
         # ★外側ダイアログの「閉じる」と区別するため内側モーダル内のみを対象にする
-        # ★2026/07/13追加: 新UI(.sp-modal-dialog/.sp-modal-content)にも対応
+        # ★2026/07/13 四次修正（実機調査で判明・重大）: 「見積もり」導線が判明したことで、
+        #   DHL「選択」クリック後は.assign_shippingパネルが自動的に閉じる（DOM上から消える）
+        #   ことを確認した。ところがこのステップは従来.sp-modal-content/.sp-modal-dialogにも
+        #   フォールバックしていたため、.assign_shippingが既に消えている状態だと**外側の
+        #   詳細/編集ダイアログ自身**（これも同じクラスを共有）を掴んでその「閉じる」ボタンを
+        #   押してしまい、保存前に編集内容ごと破棄する重大なリスクがあった
+        #   （さらに閉じるボタンが見つからない場合はEscapeキーを押していたが、これも外側
+        #   ダイアログを閉じてしまう可能性があった）。
+        #   → .assign_shipping（新UI）または.ant-modal（旧UI）が実際に存在する場合のみ閉じる
+        #     操作を行い、どちらも存在しない（＝選択時に自動で閉じていた）場合は何もしない。
+        #     Escapeキーのフォールバックも廃止（外側ダイアログを誤って閉じるリスクがあるため）。
         print("  内側モーダルを閉じる...")
         closed = False
         rect2 = page.evaluate(
             """() => {
-                // 内側モーダル内の閉じるボタンを探す（新UI優先→旧.ant-modal）
-                // ★2026/07/13: sel(SP_MODAL_SEL)は他の無関係なダイアログとクラス名が衝突するため
-                //   .assign_shippingを最優先に変更（詳細は_price_js側のコメント参照）
                 const modal = document.querySelector('.assign_shipping')
-                    || document.querySelector('.sp-modal-content')
-                    || document.querySelector('.sp-modal-dialog')
                     || document.querySelector('.ant-modal');
                 if (modal) {
                     const btns = Array.from(modal.querySelectorAll('button, [role="button"], a'));
@@ -1102,8 +1148,7 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                     }
                     // ×ボタン（旧UI: .ant-modal-close / 新UI: sp-modal内の閉じるアイコン）
                     const closeBtn = modal.querySelector('.ant-modal-close')
-                        || modal.querySelector('[class*="close"]')
-                        || (modal.closest('.sp-modal-dialog') || modal).querySelector('[class*="close"]');
+                        || modal.querySelector('[class*="close"]');
                     if (closeBtn) {
                         const r = closeBtn.getBoundingClientRect();
                         return {x: r.left + r.width / 2, y: r.top + r.height / 2};
@@ -1117,9 +1162,8 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             time.sleep(1.5)
             closed = True
             print("    閉じる [OK]")
-        if not closed:
-            page.keyboard.press("Escape")
-            time.sleep(1.5)
+        else:
+            print("    内側パネルは既に閉じていました（想定通り）")
     else:
         print("    警告: 「配送を割り当て」ボタンが見つかりません")
         # ★2026/07/05追加: 原因調査用にダイアログ内の全クリック要素をログ出力
