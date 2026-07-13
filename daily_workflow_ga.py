@@ -429,6 +429,18 @@ def main():
 
         print(f"\n送料列が空白の対象注文: {len(target_order_nos)} 件")
 
+        # ★2026/07/13 四報の修正（.assign_shipping自動クローズ対応＋見積もりステップ追加）を
+        # 本番投入する前に、まず少数件で実際のPlaywright自動化フローを通して確認するための
+        # 安全弁。VERIFY_ORDER_NOS環境変数（カンマ区切りの注文番号）が設定されている場合のみ
+        # 対象をその注文に限定する。未設定時（通常の本番運用）は従来通り全件が対象になる。
+        _verify_orders_env = os.environ.get("VERIFY_ORDER_NOS", "").strip()
+        if _verify_orders_env:
+            _verify_set = set(x.strip() for x in _verify_orders_env.split(",") if x.strip())
+            _before = len(target_order_nos)
+            target_order_nos = target_order_nos & _verify_set
+            print(f"  [検証モード] VERIFY_ORDER_NOS指定あり → 対象を{_before}件から"
+                  f"{len(target_order_nos)}件に制限: {sorted(target_order_nos)}")
+
         # Step 3: CPaSS処理
         cpass_results = {}
         # ★2026/07/09修正: 対象0件でも「発送手続き待ち→発送手続き」への移動は必ず実行する。
