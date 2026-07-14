@@ -1,0 +1,27 @@
+name: タスク2 DHL送料6件書き込み（ワンオフ）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  write-dhl-prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install openpyxl google-auth google-api-python-client
+
+      - name: Run write script
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python write_dhl_prices_ga.py
