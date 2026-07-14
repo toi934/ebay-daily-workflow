@@ -297,34 +297,60 @@ def _move_all_to_processing(page):
     time.sleep(2)
 
     # 確認ダイアログが出た場合「確認」ボタンをクリック（最大12秒待機）
+    # ★2026/07/14修正（重大バグ）: 実際のダイアログはAntD(.ant-modal)ではなく新UI
+    #   (.sp-modal-dialog > .prompt-modal-body)で、確認ボタンのテキストは「確 認」
+    #   （半角スペース入り）・クラスは ant-btn-primary ではなく ant-btn-default btn blue
+    #   だった。旧セレクタが一切マッチせず、毎回「確認ダイアログなし or 閉じ済み」と誤判定
+    #   してスキップしていたため、実際には対象パッケージが「発送手続き」タブへ一切移動され
+    #   ていなかった（ログ・GitHub Actionsは共に「Success」と表示されるため誰も気づけない
+    #   状態だった）。クリック後にダイアログが実際に消えたことまで検証してから次に進む。
     print("  確認ダイアログを待機...")
     dialog_closed = False
     for attempt in range(12):
         try:
-            # Ant Design Modal の確認ボタン（プライマリボタン）
-            for sel in [
-                'button.ant-btn-primary',
-                '.ant-modal-confirm-btns button.ant-btn-primary',
-                '.ant-modal-footer button.ant-btn-primary',
-                'button:has-text("確認")',
-                'button:has-text("OK")',
-            ]:
-                try:
-                    btn = page.locator(sel).first
-                    if btn.is_visible(timeout=500):
-                        btn.click(timeout=2000)
-                        print("    [OK] 確認ダイアログ → クリック (" + sel + ")")
-                        dialog_closed = True
-                        break
-                except Exception:
-                    pass
-            if dialog_closed:
-                break
-        except Exception:
-            pass
+            clicked = page.evaluate(
+                """() => {
+                    // ボタンテキストの空白を全て除去して「確認」「OK」と一致するものを探す
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    for (const b of btns) {
+                        const t = (b.textContent || '').replace(/\\s+/g, '');
+                        if (t === '確認' || t === 'OK') {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    // フォールバック: 新UIの確認ダイアログ内で「閉じる」以外のボタン
+                    // （＝確認・続行ボタン）をクリック
+                    const modal = document.querySelector(
+                        '.sp-modal-dialog .prompt-modal-body, .prompt-modal-body'
+                    );
+                    if (modal) {
+                        const cand = Array.from(modal.querySelectorAll('button')).find(
+                            b => (b.textContent || '').replace(/\\s+/g, '') !== '閉じる'
+                        );
+                        if (cand) { cand.click(); return true; }
+                    }
+                    return false;
+                }"""
+            )
+            if clicked:
+                time.sleep(1)
+                still_open = page.evaluate(
+                    "() => !!document.querySelector("
+                    "'.sp-modal-dialog .prompt-modal-body, .prompt-modal-body')"
+                )
+                if not still_open:
+                    print("    [OK] 確認ダイアログ → クリックで閉じたことを確認済み")
+                    dialog_closed = True
+                    break
+                else:
+                    print("    [WARN] クリックしたがダイアログがまだ残っている → 再試行")
+        except Exception as e:
+            print("    [WARN] 確認ダイアログ処理中に例外: " + str(e)[:80])
         time.sleep(1)
     if not dialog_closed:
-        print("    確認ダイアログなし or 閉じ済み")
+        print("    [ERROR] 確認ダイアログを閉じられませんでした（対象パッケージが移動されて"
+              "いない可能性が高い。CPaSS側を要確認）")
 
     time.sleep(3)
     return True
@@ -1255,17 +1281,33 @@ def _move_single_order_to_processing(page, order_no):
             loc.click(timeout=3000)
             print("  → 発送手続きへ移動クリック OK")
             time.sleep(2)
-            # 確認ダイアログ
-            for dlg_sel in ['button.ant-btn-primary', 'button:has-text("確認")', 'button:has-text("OK")']:
-                try:
-                    btn = page.locator(dlg_sel).first
-                    if btn.is_visible(timeout=1500):
-                        btn.click(timeout=2000)
-                        print("  → 確認ダイアログ OK")
-                        time.sleep(2)
-                        break
-                except Exception:
-                    pass
+            # 確認ダイアログ（★2026/07/14修正: ボタンテキストは「確 認」で空白入り・
+            # クラスもant-btn-primaryではないため、空白除去テキスト一致のJSクリックを使う）
+            try:
+                clicked = page.evaluate(
+                    """() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        for (const b of btns) {
+                            const t = (b.textContent || '').replace(/\\s+/g, '');
+                            if (t === '確認' || t === 'OK') { b.click(); return true; }
+                        }
+                        const modal = document.querySelector(
+                            '.sp-modal-dialog .prompt-modal-body, .prompt-modal-body'
+                        );
+                        if (modal) {
+                            const cand = Array.from(modal.querySelectorAll('button')).find(
+                                b => (b.textContent || '').replace(/\\s+/g, '') !== '閉じる'
+                            );
+                            if (cand) { cand.click(); return true; }
+                        }
+                        return false;
+                    }"""
+                )
+                if clicked:
+                    print("  → 確認ダイアログ OK")
+                    time.sleep(2)
+            except Exception:
+                pass
             return True
         except Exception:
             continue
