@@ -86,8 +86,13 @@ HS_CODE_RULES = [
                     "bike helmet", "motorcycle helmet"], "ヘルメット"),
 
     # === 工具 ===
+    # 2026/07/15 戸井さん確認済み: MASAKUNI等の盆栽用切断工具(knob cutter等)も
+    # 盆栽鋏と同じ8201500000でよい → キーワード追加（"bonsai" + "cutter"系語が離れていても拾えるように）
     ("8201500000", ["bonsai scissors", "bonsai shears", "盆栽鋏",
-                    "garden shears", "pruning shears", "剪定鋏"], "盆栽鋏、園芸鋏"),
+                    "garden shears", "pruning shears", "剪定鋏",
+                    "knob cutter", "concave cutter", "branch cutter",
+                    "root cutter", "bonsai tool", "盆栽 鋏", "盆栽鏝",
+                    "masakuni"], "盆栽鋏、園芸鋏（盆栽工具全般）"),
 
     # === バッグ類（"Book Bag" などが book に誤マッチするのを防ぐため本より先）===
     # ※戸井さん要確認: HSコード 4202929900 (バッグ・カバン類の一般値)
