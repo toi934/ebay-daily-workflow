@@ -711,7 +711,7 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     3. 「保存する」クリック
 
     Args:
-        weight_kg: 梱包重量(kg)
+        weight_kg: 単位重量(kg)に入力する推定重量（★2026/07/17確定: 「梱包」欄には入力しない）
         length_cm, width_cm, height_cm: サイズ
         hs_code: HSコード（10桁）
 
@@ -773,9 +773,13 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             }
             const results = {};
 
-            // 梱包重量（配送概要セクションの「梱包」入力欄）
-            const wInput = findInputNear('梱包');
-            results.weight = setValue(wInput, args.weight);
+            // ★2026/07/17確定: 「梱包」欄への書き込みは廃止。
+            //   単位重量と梱包の両方に同じ推定重量を入れると、CPaSS側が自動的に合算してしまい
+            //   （例: 各2kg→合計4kg扱い）、実際より重い扱いになってDHL送料が過大に計算される
+            //   バグが判明（戸井さん指摘）。以後は「単位重量」欄だけに入力し、「梱包」欄は
+            //   触らない（0のまま）。過去にCPaSS上へ書き込み済みの「梱包」値は遡って修正しない
+            //   （戸井さん指示）。
+            results.weight = null;
 
             // 単位重量（アイテムリストの「単位重量(kg)」入力欄）
             // ★2026/07/10確定: eBay継承値が0のままだとDHL価格パネルが無限ロードして
