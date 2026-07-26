@@ -280,6 +280,10 @@ def process_xlsm(xlsm_path, cpass_results, dry_run=False):
     ex_cols = find_exchange_cols(ws)
     writes = []
     fill_details = {"A": 0, "E": 0, "F": 0, shipping_col: 0, "exchange": 0}
+    # 為替カスケード用: 静的スナップショット参照バグ修正（2026/07/26）
+    # 行を舐めながら「直近で確定した為替値」をここに保持し続ける（writesに積んだ値も反映）。
+    # これにより同一実行内で新規空欄行が連続しても正しく前の値を引き継げる。
+    last_exchange_val = {ec["col"]: None for ec in ex_cols}
 
     for row in range(2, (ws.max_row or 9999) + 1):
         order_val = ws.cell(row=row, column=2).value
@@ -313,15 +317,18 @@ def process_xlsm(xlsm_path, cpass_results, dry_run=False):
                 writes.append((row, ship_col_idx, int(cpass_info["dhl_price_jpy"])))
                 fill_details[shipping_col] += 1
 
-        if not is_cancel:
-            for ex_col in ex_cols:
-                cell_val = ws.cell(row=row, column=ex_col["col"]).value
-                if cell_val is None or (isinstance(cell_val, str) and cell_val.strip() == ""):
-                    if row > 2:
-                        prev_val = ws.cell(row=row - 1, column=ex_col["col"]).value
-                        if prev_val is not None and prev_val != "":
-                            writes.append((row, ex_col["col"], prev_val))
-                            fill_details["exchange"] += 1
+        # === 為替セル: 直近の確定値を保持しながら上から順にコピー（キャンセル行は書き込みのみスキップ）===
+        for ex_col in ex_cols:
+            col = ex_col["col"]
+            cell_val = ws.cell(row=row, column=col).value
+            if cell_val is not None and not (isinstance(cell_val, str) and cell_val.strip() == ""):
+                # 実値が入っている行 → 以降の空欄行の引き継ぎ元として更新
+                last_exchange_val[col] = cell_val
+            elif not is_cancel:
+                if last_exchange_val.get(col) is not None:
+                    # last_exchange_val はここで書き換えない＝そのまま次の空欄行にも引き継がれる
+                    writes.append((row, col, last_exchange_val[col]))
+                    fill_details["exchange"] += 1
 
     wb.close()
 
