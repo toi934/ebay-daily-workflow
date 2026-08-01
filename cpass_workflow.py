@@ -801,6 +801,17 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     Returns:
         tuple: (saved_ok: bool, dhl_price_jpy: int|None)
     """
+    # ★2026/08/02確定バグ修正②: dimension_weight_lookupのデフォルト値は0.5kgのため
+    #   通常ここが0になることは無いはずだが、万が一None/0が渡ってきた場合に備え、
+    #   「無効な重量」でDHL見積もりが失敗するのを防ぐため最小値0.1kgにクランプする。
+    try:
+        if not weight_kg or float(weight_kg) <= 0:
+            print("    [WARN] weight_kgが0以下のため0.1kgにフォールバック（元の値: " + str(weight_kg) + "）")
+            weight_kg = 0.1
+    except (TypeError, ValueError):
+        print("    [WARN] weight_kgが不正な値のため0.1kgにフォールバック（元の値: " + str(weight_kg) + "）")
+        weight_kg = 0.1
+
     print("  フォーム入力: 重量=" + str(weight_kg) +
           "kg, " + str(length_cm) + "x" + str(width_cm) + "x" + str(height_cm) +
           "cm, HS=" + hs_code)
@@ -852,6 +863,14 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                 nativeSetter.call(input, String(value));
                 input.dispatchEvent(new Event('input', { bubbles: true }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
+                // ★2026/08/02確定バグ修正②: AntD InputNumber等はonBlurで初めて内部stateを
+                //   確定コミットするコンポーネントがあり、input/changeイベントだけでは
+                //   「配送を割り当て」クリック時にまだ古い(0の)値をバックエンドへ送ってしまう
+                //   タイミング競合が起きうる（DOM上の見た目の値と実際にコミットされた値がズレる）。
+                //   明示的にfocus→blurを発火させ、コミットを確実に発生させる。
+                try { input.focus(); } catch (e) {}
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+                try { input.blur(); } catch (e) {}
                 return true;
             }
             const results = {};
@@ -928,8 +947,63 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             }"""
         )
         print("    [DEBUG] 入力後の実値: " + json.dumps(verify, ensure_ascii=False))
+
+        # ★2026/08/02確定バグ修正②: 単位重量の読み戻しが0/空のままなら、
+        #   まだReact側のstateコミットが間に合っていない可能性が高いため、
+        #   もう一度同じ値を入力し直し、コミットのための待機時間を追加で取る。
+        #   これは「無効な重量」でDHL見積もりが失敗する既知バグ（画面上は0.500に
+        #   見えるのに配送を割り当てクリック時には0扱いされていたケース）への対策。
+        uw = verify.get("単位重量") if verify else None
+        try:
+            uw_val = float(uw) if uw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            uw_val = 0.0
+        if uw_val <= 0:
+            print("    [WARN] 単位重量の読み戻しが0のため再入力を実施します")
+            page.evaluate(
+                """(args) => {
+                    function findInputNear(labelText) {
+                        const labels = Array.from(document.querySelectorAll('*'))
+                            .filter(el => {
+                                const t = (el.textContent || '').trim();
+                                return t.startsWith(labelText) && el.children.length === 0;
+                            });
+                        for (const lbl of labels) {
+                            let parent = lbl;
+                            for (let i = 0; i < 6; i++) {
+                                parent = parent.parentElement;
+                                if (!parent) break;
+                                const inp = parent.querySelector('input, textarea');
+                                if (inp) return inp;
+                            }
+                        }
+                        return null;
+                    }
+                    const uInput = findInputNear('単位重量');
+                    if (!uInput) return false;
+                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    nativeSetter.call(uInput, String(args.weight));
+                    uInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    uInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    try { uInput.focus(); } catch (e) {}
+                    uInput.dispatchEvent(new Event('blur', { bubbles: true }));
+                    try { uInput.blur(); } catch (e) {}
+                    return true;
+                }""",
+                {"weight": weight_kg},
+            )
+            time.sleep(2)
     except Exception as e:
         print("    [DEBUG] 実値検証失敗: " + str(e)[:60])
+
+    # ★2026/08/02確定バグ修正②: 入力直後にすぐ「配送を割り当て」を押すと、
+    #   CPaSS側のstate反映（デバウンス等）に間に合わず古い重量(0)でバックエンドの
+    #   価格計算APIが呼ばれてしまい、結果として配送業者一覧が正しく表示されず
+    #   「DHL「選択」ボタンが見つかりません」（バグ①）につながっていた疑いがある。
+    #   人間が手動操作する場合は自然に数秒の間が空くため再現しなかった。
+    #   → 明示的なバッファ待機を追加する。
+    time.sleep(2)
 
     # 2. 「配送を割り当て」クリック → 内側モーダルが開く → DHL「選択」→価格取得
     print("  「配送を割り当て」クリック...")
@@ -1095,7 +1169,10 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             }"""
         )
         picked = False
-        _deadline = time.time() + 18
+        # ★2026/08/02確定バグ修正①: 18秒→25秒に延長。価格計算が非同期のため
+        #   行(.shipping_method等)自体がまだ描画されていないタイミングで
+        #   ポーリングが打ち切られていた可能性があるための保険的措置。
+        _deadline = time.time() + 25
         while time.time() < _deadline and not picked:
             picked = page.evaluate(pick_js)
             if not picked:
@@ -1125,6 +1202,36 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                 print("    [WARN] 「見積もり」ボタンが見つかりません（価格が空欄になる可能性）")
         else:
             print("    [WARN] DHL「選択」ボタンが見つかりません")
+            # ★2026/08/02確定バグ修正①: 次回以降の原因切り分けのため、
+            #   配送業者一覧(.shipping_method等)がそもそも描画されていたか、
+            #   描画されていたなら各行の中身(DHLの有無・「選択」ボタンの有無)を
+            #   実機に再現せずログだけで確認できるようダンプする。
+            try:
+                rows_dbg = page.evaluate(
+                    """() => {
+                        const roots = [document.querySelector('.assign_shipping'),
+                                       document.querySelector('.sp-modal-content'),
+                                       document.querySelector('.sp-modal-dialog'),
+                                       document.querySelector('.ant-modal'), document].filter(Boolean);
+                        for (const root of roots) {
+                            const rows = Array.from(root.querySelectorAll(
+                                '.shipping_method, .shipping_service, tr, .ant-list-item, .ant-card, li'));
+                            if (rows.length) {
+                                return {
+                                    root_matched: root.className || root.tagName,
+                                    row_count: rows.length,
+                                    rows: rows.slice(0, 15).map(r => (r.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 80))
+                                };
+                            }
+                        }
+                        return {root_matched: null, row_count: 0, rows: []};
+                    }"""
+                )
+                print("    [DEBUG] 配送業者行一覧(" + str(rows_dbg.get("row_count")) + "件, root="
+                      + str(rows_dbg.get("root_matched")) + "): "
+                      + json.dumps(rows_dbg.get("rows"), ensure_ascii=False)[:1200])
+            except Exception as e:
+                print("    [DEBUG] 配送業者行一覧の取得失敗: " + str(e)[:60])
 
         # ★2026/07/09 重大バグ修正:
         # 旧実装は「選択」ボタンが見つからない/割り当てパネルが出ない場合でも
