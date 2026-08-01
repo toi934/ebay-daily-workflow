@@ -52,6 +52,51 @@ CPASS_TAB_URLS = {
 }
 
 
+def _dismiss_shipping_origin_modal(page):
+    """★2026/08/02追加: CPaSSログインページに新しく現れるようになった
+    「Please let us know from where you will ship your items」モーダルを閉じる。
+
+    このモーダルはログインフォームの上に被さるオーバーレイで、閉じないまま
+    ユーザー名/パスワード欄への入力・サインインボタンのクリックを試みると、
+    要素自体はis_visible()的には「見える」判定になるため例外も出ず、しかし
+    実際にはクリックがオーバーレイに阻まれてログインが完了しない
+    （page.url が /login のまま変わらない）→ 発送手続き待ち→発送手続き移動や
+    発送手続きタブのスクレイピングが軒並み0件になり、対象注文の送料が
+    いつまでも空欄になる、という重大バグの原因だった（2026/08/02発覚）。
+    """
+    try:
+        # 「Japan」を選んでから「Continue」をクリックする経路を優先
+        # （東アジア(East Asia)セクション内の「Japan」ボタン）
+        japan_btn = page.locator('text="Japan"').first
+        if japan_btn.is_visible(timeout=2000):
+            japan_btn.click(timeout=2000)
+            time.sleep(0.5)
+            continue_btn = page.locator('button:has-text("Continue")').first
+            if continue_btn.is_visible(timeout=2000):
+                continue_btn.click(timeout=2000)
+                time.sleep(1.5)
+                print("    [OK] 配送元国選択モーダルを閉じた（Japan→Continue）")
+                return True
+    except Exception as e:
+        print("    [DEBUG] Japan/Continue経路失敗: " + str(e)[:80])
+
+    # フォールバック: モーダル右上の×ボタンで閉じる
+    try:
+        for sel in ['[role="dialog"] button:has-text("×")', 'button[aria-label="Close"]',
+                    '.ant-modal-close', '[role="dialog"] svg']:
+            close_btn = page.locator(sel).first
+            if close_btn.is_visible(timeout=1500):
+                close_btn.click(timeout=1500)
+                time.sleep(1)
+                print("    [OK] 配送元国選択モーダルを閉じた（×ボタン, " + sel + "）")
+                return True
+    except Exception as e:
+        print("    [DEBUG] ×ボタン経路失敗: " + str(e)[:80])
+
+    print("    [DEBUG] 配送元国選択モーダルは検出されず（表示されていない可能性）")
+    return False
+
+
 def _login(page):
     """CPaSS にログイン"""
     print("CPaSS ログイン中...")
@@ -61,6 +106,10 @@ def _login(page):
         page.wait_for_load_state("networkidle", timeout=10000)
     except Exception:
         pass
+
+    # ★2026/08/02追加: ログインフォームの前に出る配送元国選択モーダルを閉じる
+    _dismiss_shipping_origin_modal(page)
+    time.sleep(1)
 
     # ユーザー名
     for sel in ['input[type="text"]', 'input[type="email"]', '#userid']:
@@ -92,6 +141,40 @@ def _login(page):
 
     time.sleep(4)
     print("ログイン後URL: " + page.url)
+
+    # ★2026/08/02追加: ログイン失敗を静かに見逃さないための検証
+    # （旧コードはURLを表示するだけで成否判定をしていなかったため、モーダル未対応等で
+    #   ログインが実際には失敗していても後続処理がそのまま進み「0件」で静かに終わっていた）
+    if "/login" in page.url:
+        print("    [WARN] ログイン後もURLが/loginのまま → ログイン失敗の疑い。モーダル閉じ→再試行します")
+        _dismiss_shipping_origin_modal(page)
+        time.sleep(1)
+        for sel in ['input[type="text"]', 'input[type="email"]', '#userid']:
+            try:
+                if page.locator(sel).first.is_visible(timeout=2000):
+                    page.locator(sel).first.fill(cpass_config.CPASS_EMAIL)
+                    break
+            except Exception:
+                pass
+        for sel in ['input[type="password"]', '#pass']:
+            try:
+                if page.locator(sel).first.is_visible(timeout=2000):
+                    page.locator(sel).first.fill(cpass_config.CPASS_PASSWORD)
+                    break
+            except Exception:
+                pass
+        for sel in ['button:has-text("サインイン")', 'button:has-text("Sign in")',
+                    'button[type="submit"]', 'input[type="submit"]']:
+            try:
+                if page.locator(sel).first.is_visible(timeout=2000):
+                    page.locator(sel).first.click()
+                    break
+            except Exception:
+                pass
+        time.sleep(4)
+        print("    再試行後URL: " + page.url)
+        if "/login" in page.url:
+            print("    [ERROR] 再試行後もログインに失敗しています。CPaSS側のUI変更やパスワード変更の可能性があります")
 
 
 def _scrape_orders_from_page(page):
