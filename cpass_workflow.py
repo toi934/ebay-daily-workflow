@@ -87,6 +87,43 @@ def _dismiss_shipping_origin_modal(page):
     return False
 
 
+def _dismiss_announcement_modal(page):
+    """CPaSS ログイン後の注文一覧ページに不定期に出る「最新のお知らせ」モーダルを閉じる
+    （2026/08/02 六報で戸井さんが実機確認・「×を閉じて、進め」との指示を受けて追加）。
+
+    ログインページの配送元国選択モーダル（_dismiss_shipping_origin_modal）とは別物。
+    こちらはログイン後の注文一覧ページ（CPASS_ENTRY_URL等）で表示される、お知らせ一覧
+    （例: 1/50ページ）のモーダルで、右上の×ボタンで閉じる。閉じないまま後続のチェック
+    ボックス操作・確認ダイアログクリックを行うと、モーダルが画面をブロックして
+    「発送手続き待ち→発送手続き」一括移動の確認ダイアログが閉じられない等の不具合の
+    原因になる可能性があるため、ページ遷移直後に必ず呼び出す（存在しなければ何もしない）。
+    """
+    try:
+        found = page.locator('text=最新のお知らせ').first
+        if not found.is_visible(timeout=1500):
+            return False
+    except Exception:
+        return False
+
+    print("    [DEBUG] 「最新のお知らせ」モーダルを検出")
+
+    for sel in ['[role="dialog"] button[aria-label="Close"]', '[role="dialog"] .ant-modal-close',
+                '.ant-modal-close', 'button[aria-label="Close"]',
+                '[role="dialog"] button:has-text("×")', '[role="dialog"] svg']:
+        try:
+            close_btn = page.locator(sel).first
+            if close_btn.is_visible(timeout=1500):
+                close_btn.click(timeout=2000)
+                time.sleep(1)
+                print("    [OK] 「最新のお知らせ」モーダルを閉じた（" + sel + "）")
+                return True
+        except Exception:
+            continue
+
+    print("    [WARN] 「最新のお知らせ」モーダルを検出したが閉じるボタンが見つからず")
+    return False
+
+
 def _login(page):
     """CPaSS にログイン"""
     print("CPaSS ログイン中...")
@@ -1539,6 +1576,8 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
             except Exception:
                 pass
 
+            _dismiss_announcement_modal(page)
+
             # ★正しいフロー（2026/05/24 確認）:
             # Step A: 発送手続き待ち を全件 発送手続き へ一括移動
             # Step B: 発送手続き タブで「詳細を見る」→入力→配送を割り当て→DHL取得→保存
@@ -1553,6 +1592,8 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                 page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
+
+            _dismiss_announcement_modal(page)
 
             # デバッグ: ページHTMLを保存
             try:
