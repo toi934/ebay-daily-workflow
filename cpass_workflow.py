@@ -42,31 +42,22 @@ USER_AGENT = (
 )
 
 # CPaSS タブ別URL（HTMLダンプで確認済み）
-CPASS_ENTRY_URL = "https://cpass.ebay.com/order/paid"
+# 2026/08/02: CPaSSは発送元地域ごとに専用サイトを使う仕様に変更されており、地域指定なし
+# (/jp/を含まない)URLでアクセスすると日本発送用のShipping Labelを購入できない状態になる
+# (CPaSS「最新のお知らせ」モーダル・戸井さん実機確認・指示により判明)。全URLに/jp/を追加。
+CPASS_ENTRY_URL = "https://cpass.ebay.com/jp/order/paid"
 CPASS_TAB_URLS = {
-    "発送手続き待ち": "https://cpass.ebay.com/order/paid",
-    "発送手続き":     "https://cpass.ebay.com/order/readytoship",
-    "キャンセル":     "https://cpass.ebay.com/order/cancelled",
-    "出荷待ち":       "https://cpass.ebay.com/order/labelprinted",
-    "出荷":           "https://cpass.ebay.com/order/intransit",
+    "発送手続き待ち": "https://cpass.ebay.com/jp/order/paid",
+    "発送手続き":     "https://cpass.ebay.com/jp/order/readytoship",
+    "キャンセル":     "https://cpass.ebay.com/jp/order/cancelled",
+    "出荷待ち":       "https://cpass.ebay.com/jp/order/labelprinted",
+    "出荷":           "https://cpass.ebay.com/jp/order/intransit",
 }
 
 
 def _dismiss_shipping_origin_modal(page):
-    """★2026/08/02追加: CPaSSログインページに新しく現れるようになった
-    「Please let us know from where you will ship your items」モーダルを閉じる。
-
-    このモーダルはログインフォームの上に被さるオーバーレイで、閉じないまま
-    ユーザー名/パスワード欄への入力・サインインボタンのクリックを試みると、
-    要素自体はis_visible()的には「見える」判定になるため例外も出ず、しかし
-    実際にはクリックがオーバーレイに阻まれてログインが完了しない
-    （page.url が /login のまま変わらない）→ 発送手続き待ち→発送手続き移動や
-    発送手続きタブのスクレイピングが軒並み0件になり、対象注文の送料が
-    いつまでも空欄になる、という重大バグの原因だった（2026/08/02発覚）。
-    """
+    """CPaSSログインページに新しく現れるようになった配送元国選択モーダルを閉じる（2026/08/02追加）"""
     try:
-        # 「Japan」を選んでから「Continue」をクリックする経路を優先
-        # （東アジア(East Asia)セクション内の「Japan」ボタン）
         japan_btn = page.locator('text="Japan"').first
         if japan_btn.is_visible(timeout=2000):
             japan_btn.click(timeout=2000)
@@ -75,25 +66,24 @@ def _dismiss_shipping_origin_modal(page):
             if continue_btn.is_visible(timeout=2000):
                 continue_btn.click(timeout=2000)
                 time.sleep(1.5)
-                print("    [OK] 配送元国選択モーダルを閉じた（Japan→Continue）")
+                print("    [OK] 配送元国選択モーダルを閉じた(Japan/Continue)")
                 return True
     except Exception as e:
         print("    [DEBUG] Japan/Continue経路失敗: " + str(e)[:80])
 
-    # フォールバック: モーダル右上の×ボタンで閉じる
     try:
-        for sel in ['[role="dialog"] button:has-text("×")', 'button[aria-label="Close"]',
+        for sel in ['[role="dialog"] button:has-text("x")', 'button[aria-label="Close"]',
                     '.ant-modal-close', '[role="dialog"] svg']:
             close_btn = page.locator(sel).first
             if close_btn.is_visible(timeout=1500):
                 close_btn.click(timeout=1500)
                 time.sleep(1)
-                print("    [OK] 配送元国選択モーダルを閉じた（×ボタン, " + sel + "）")
+                print("    [OK] 配送元国選択モーダルを閉じた(closeボタン, " + sel + ")")
                 return True
     except Exception as e:
-        print("    [DEBUG] ×ボタン経路失敗: " + str(e)[:80])
+        print("    [DEBUG] closeボタン経路失敗: " + str(e)[:80])
 
-    print("    [DEBUG] 配送元国選択モーダルは検出されず（表示されていない可能性）")
+    print("    [DEBUG] 配送元国選択モーダルは検出されず")
     return False
 
 
@@ -107,7 +97,6 @@ def _login(page):
     except Exception:
         pass
 
-    # ★2026/08/02追加: ログインフォームの前に出る配送元国選択モーダルを閉じる
     _dismiss_shipping_origin_modal(page)
     time.sleep(1)
 
@@ -142,11 +131,8 @@ def _login(page):
     time.sleep(4)
     print("ログイン後URL: " + page.url)
 
-    # ★2026/08/02追加: ログイン失敗を静かに見逃さないための検証
-    # （旧コードはURLを表示するだけで成否判定をしていなかったため、モーダル未対応等で
-    #   ログインが実際には失敗していても後続処理がそのまま進み「0件」で静かに終わっていた）
     if "/login" in page.url:
-        print("    [WARN] ログイン後もURLが/loginのまま → ログイン失敗の疑い。モーダル閉じ→再試行します")
+        print("    [WARN] ログイン後もURLが/loginのまま -> ログイン失敗の疑い。モーダル閉じ->再試行します")
         _dismiss_shipping_origin_modal(page)
         time.sleep(1)
         for sel in ['input[type="text"]', 'input[type="email"]', '#userid']:
@@ -801,9 +787,9 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     Returns:
         tuple: (saved_ok: bool, dhl_price_jpy: int|None)
     """
-    # ★2026/08/02確定バグ修正②: dimension_weight_lookupのデフォルト値は0.5kgのため
-    #   通常ここが0になることは無いはずだが、万が一None/0が渡ってきた場合に備え、
-    #   「無効な重量」でDHL見積もりが失敗するのを防ぐため最小値0.1kgにクランプする。
+    # 2026/08/02: dimension_weight_lookupのデフォルト値は0.5kgのため通常0にはならないが、
+    # 万が一None/0が渡ってきた場合に備え、無効な重量でDHL見積もりが失敗するのを防ぐため
+    # 最小値0.1kgにクランプする。
     try:
         if not weight_kg or float(weight_kg) <= 0:
             print("    [WARN] weight_kgが0以下のため0.1kgにフォールバック（元の値: " + str(weight_kg) + "）")
@@ -863,11 +849,10 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                 nativeSetter.call(input, String(value));
                 input.dispatchEvent(new Event('input', { bubbles: true }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
-                // ★2026/08/02確定バグ修正②: AntD InputNumber等はonBlurで初めて内部stateを
-                //   確定コミットするコンポーネントがあり、input/changeイベントだけでは
-                //   「配送を割り当て」クリック時にまだ古い(0の)値をバックエンドへ送ってしまう
-                //   タイミング競合が起きうる（DOM上の見た目の値と実際にコミットされた値がズレる）。
-                //   明示的にfocus→blurを発火させ、コミットを確実に発生させる。
+                // 2026/08/02: AntD InputNumber等はonBlurで内部stateを確定コミットする
+                // ものがあり、input/changeだけでは「配送を割り当て」クリック時にまだ古い
+                // (0の)値をバックエンドへ送ってしまうタイミング競合が起きうる。
+                // 明示的にfocus→blurを発火させ、コミットを確実に発生させる。
                 try { input.focus(); } catch (e) {}
                 input.dispatchEvent(new Event('blur', { bubbles: true }));
                 try { input.blur(); } catch (e) {}
@@ -948,11 +933,9 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
         )
         print("    [DEBUG] 入力後の実値: " + json.dumps(verify, ensure_ascii=False))
 
-        # ★2026/08/02確定バグ修正②: 単位重量の読み戻しが0/空のままなら、
-        #   まだReact側のstateコミットが間に合っていない可能性が高いため、
-        #   もう一度同じ値を入力し直し、コミットのための待機時間を追加で取る。
-        #   これは「無効な重量」でDHL見積もりが失敗する既知バグ（画面上は0.500に
-        #   見えるのに配送を割り当てクリック時には0扱いされていたケース）への対策。
+        # 2026/08/02: 単位重量の読み戻しが0/空のままなら、まだReact側のstateコミットが
+        # 間に合っていない可能性が高いため、もう一度同じ値を入力し直し、コミットのための
+        # 待機時間を追加で取る（「無効な重量」でDHL見積もりが失敗する既知バグへの対策）。
         uw = verify.get("単位重量") if verify else None
         try:
             uw_val = float(uw) if uw not in (None, "") else 0.0
@@ -997,12 +980,11 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
     except Exception as e:
         print("    [DEBUG] 実値検証失敗: " + str(e)[:60])
 
-    # ★2026/08/02確定バグ修正②: 入力直後にすぐ「配送を割り当て」を押すと、
-    #   CPaSS側のstate反映（デバウンス等）に間に合わず古い重量(0)でバックエンドの
-    #   価格計算APIが呼ばれてしまい、結果として配送業者一覧が正しく表示されず
-    #   「DHL「選択」ボタンが見つかりません」（バグ①）につながっていた疑いがある。
-    #   人間が手動操作する場合は自然に数秒の間が空くため再現しなかった。
-    #   → 明示的なバッファ待機を追加する。
+    # 2026/08/02: 入力直後にすぐ「配送を割り当て」を押すと、CPaSS側のstate反映
+    # (デバウンス等)に間に合わず古い重量(0)でバックエンドの価格計算APIが呼ばれてしまい、
+    # 結果として配送業者一覧が正しく表示されず「DHL「選択」ボタンが見つかりません」
+    # (バグ①)につながっていた疑いがある。人間が手動操作する場合は自然に数秒の間が
+    # 空くため再現しなかった。→ 明示的なバッファ待機を追加する。
     time.sleep(2)
 
     # 2. 「配送を割り当て」クリック → 内側モーダルが開く → DHL「選択」→価格取得
@@ -1169,9 +1151,9 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
             }"""
         )
         picked = False
-        # ★2026/08/02確定バグ修正①: 18秒→25秒に延長。価格計算が非同期のため
-        #   行(.shipping_method等)自体がまだ描画されていないタイミングで
-        #   ポーリングが打ち切られていた可能性があるための保険的措置。
+        # 2026/08/02: 18秒→25秒に延長。価格計算が非同期のため行(.shipping_method等)
+        # 自体がまだ描画されていないタイミングでポーリングが打ち切られていた可能性が
+        # あるための保険的措置。
         _deadline = time.time() + 25
         while time.time() < _deadline and not picked:
             picked = page.evaluate(pick_js)
@@ -1202,10 +1184,10 @@ def _fill_edit_form_and_save(page, weight_kg, length_cm, width_cm, height_cm, hs
                 print("    [WARN] 「見積もり」ボタンが見つかりません（価格が空欄になる可能性）")
         else:
             print("    [WARN] DHL「選択」ボタンが見つかりません")
-            # ★2026/08/02確定バグ修正①: 次回以降の原因切り分けのため、
-            #   配送業者一覧(.shipping_method等)がそもそも描画されていたか、
-            #   描画されていたなら各行の中身(DHLの有無・「選択」ボタンの有無)を
-            #   実機に再現せずログだけで確認できるようダンプする。
+            # 2026/08/02: 次回以降の原因切り分けのため、配送業者一覧
+            # (.shipping_method等)がそもそも描画されていたか、描画されていたなら
+            # 各行の中身(DHLの有無・「選択」ボタンの有無)を実機再現せずログだけで
+            # 確認できるようダンプする。
             try:
                 rows_dbg = page.evaluate(
                     """() => {
