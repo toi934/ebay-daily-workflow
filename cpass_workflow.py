@@ -26,6 +26,8 @@ import os
 import re
 import time
 import json
+import requests
+import xml.etree.ElementTree as ET
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -35,6 +37,149 @@ except Exception:
 import cpass_config
 import hs_code_lookup
 import dimension_weight_lookup
+
+# ============================================================
+# ★2026/08/04確定: DHL見積もり用の重量は、タイトルからのキーワード推定
+#   (dimension_weight_lookup)ではなく、まずeBay実データを最優先で使う。
+#   戸井さん指摘「送料が全部0.5kgで計算されている、ちゃんと調べろ」に対応。
+#   ローカル版(ﾀｽｸ2_売上管理表)と同一ロジック。詳細コメントはローカル版参照。
+#
+#   ★GA版特有の注意: このリポジトリ(toi934/ebay-daily-workflow)には従来、
+#   eBay Trading API用の認証情報(APP_ID/DEV_ID/CERT_ID/TSUJOU_TOKEN/SENMON_TOKEN)が
+#   Secretsとして登録されていない（Google Drive/CPaSS/Gmail用のSecretsのみ）。
+#   この重量取得を有効にするには、タスク1(ebay-restock)・タスク5(ebay-auto-reply)と
+#   同じ値で以下5つのSecretsをこのリポジトリにも追加する必要がある:
+#     APP_ID, DEV_ID, CERT_ID, TSUJOU_TOKEN, SENMON_TOKEN
+#   未設定の場合はGetItemが失敗し、従来通りタイトルキーワード推定にフォールバックする
+#   （エラーにはならず処理は継続するが、重量精度の改善効果が得られない）。
+# ============================================================
+
+TRADING_API_URL = "https://api.ebay.com/ws/api.dll"
+TRADING_NS = {"e": "urn:ebay:apis:eBLBaseComponents"}
+_SHIP_PROFILE_WEIGHT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*kg", re.IGNORECASE)
+
+_GA_ACCOUNTS = {
+    "tsujou": {
+        "TOKEN": os.environ.get("TSUJOU_TOKEN", ""),
+        "APP_ID": os.environ.get("APP_ID", ""),
+        "DEV_ID": os.environ.get("DEV_ID", ""),
+        "CERT_ID": os.environ.get("CERT_ID", ""),
+    },
+    "senmon": {
+        "TOKEN": os.environ.get("SENMON_TOKEN", ""),
+        "APP_ID": os.environ.get("APP_ID", ""),
+        "DEV_ID": os.environ.get("DEV_ID", ""),
+        "CERT_ID": os.environ.get("CERT_ID", ""),
+    },
+}
+
+
+def resolve_account_by_item_id(item_id):
+    """US Item IDの先頭数字でアカウントを判定する
+    （タスク1除外リスト判定・タスク6と同じ確定ルールを流用: 2026/07/27）
+
+    3から始まる → 専門(senmon) / それ以外（1から始まる等）→ 通常(tsujou、デフォルト)
+    """
+    s = str(item_id or "").strip()
+    if s.startswith("3"):
+        return "senmon"
+    return "tsujou"
+
+
+def get_ebay_shipping_weight_kg(item_id, account_name=None):
+    """Trading API GetItemで、このitem_idに割り当てられているShipping Policy名
+    から実重量(kg)を取得する（ローカル版と同一ロジック。詳細はそちらのコメント参照）。
+
+    Returns:
+        (weight_kg: float|None, source: str, error: str|None)
+    """
+    if not item_id:
+        return None, "none", "item_idが空のため取得不可"
+
+    if account_name is None:
+        account_name = resolve_account_by_item_id(item_id)
+
+    account = _GA_ACCOUNTS.get(account_name, {})
+    if not account.get("TOKEN") or not account.get("APP_ID"):
+        return None, "none", "eBay API認証情報が未設定（Secrets未登録の可能性）"
+
+    xml_body = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">\n'
+        '  <RequesterCredentials>\n'
+        '    <eBayAuthToken>' + account["TOKEN"] + '</eBayAuthToken>\n'
+        '  </RequesterCredentials>\n'
+        '  <ItemID>' + str(item_id) + '</ItemID>\n'
+        '  <DetailLevel>ReturnAll</DetailLevel>\n'
+        '</GetItemRequest>\n'
+    )
+    headers = {
+        "X-EBAY-API-CALL-NAME": "GetItem",
+        "X-EBAY-API-SITEID": "0",
+        "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
+        "X-EBAY-API-APP-NAME": account["APP_ID"],
+        "X-EBAY-API-DEV-NAME": account["DEV_ID"],
+        "X-EBAY-API-CERT-NAME": account["CERT_ID"],
+        "Content-Type": "text/xml",
+    }
+
+    try:
+        resp = requests.post(TRADING_API_URL, headers=headers,
+                              data=xml_body.encode("utf-8"), timeout=20)
+    except Exception as e:
+        return None, "none", "GetItemリクエスト失敗: " + str(e)[:150]
+
+    if resp.status_code != 200:
+        return None, "none", "GetItem HTTP " + str(resp.status_code)
+
+    try:
+        root = ET.fromstring(resp.text)
+    except Exception as e:
+        return None, "none", "GetItemレスポンス解析エラー: " + str(e)[:150]
+
+    ack = root.findtext("e:Ack", default="", namespaces=TRADING_NS)
+    if ack not in ("Success", "Warning"):
+        errors = root.findall(".//e:Errors", TRADING_NS)
+        msgs = [(e.findtext("e:ShortMessage", default="", namespaces=TRADING_NS) or "")
+                for e in errors]
+        return None, "none", "GetItem Ack=" + str(ack) + " " + "; ".join(m for m in msgs if m)[:150]
+
+    item = root.find(".//e:Item", TRADING_NS)
+    if item is None:
+        return None, "none", "GetItem: Item要素が見つかりません"
+
+    # ① 最優先: Shipping Policy名から実重量を抽出（例: "1.5kg_202605" → 1.5）
+    profile_name = item.findtext(
+        "e:SellerProfiles/e:SellerShippingProfile/e:ShippingProfileName",
+        default="", namespaces=TRADING_NS)
+    if profile_name:
+        m = _SHIP_PROFILE_WEIGHT_RE.search(profile_name)
+        if m:
+            try:
+                w = float(m.group(1))
+                if w > 0:
+                    return w, "shipping_policy(" + profile_name + ")", None
+            except ValueError:
+                pass
+
+    # ② 次点: ShippingPackageDetailsの実測重量（設定されている場合。lb/oz想定）
+    weight_major = item.findtext("e:ShippingPackageDetails/e:WeightMajor",
+                                  default="", namespaces=TRADING_NS)
+    weight_minor = item.findtext("e:ShippingPackageDetails/e:WeightMinor",
+                                  default="", namespaces=TRADING_NS)
+    try:
+        lb = float(weight_major) if weight_major else 0.0
+        oz = float(weight_minor) if weight_minor else 0.0
+        total_lb = lb + oz / 16.0
+        if total_lb > 0:
+            return round(total_lb * 0.45359237, 3), "package_weight_lb_oz", None
+    except ValueError:
+        pass
+
+    return (None, "none",
+            "Shipping Policy名(" + repr(profile_name) +
+            ")からもPackage重量からも取得できず")
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1630,9 +1775,22 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                 print("  Title: " + order.get("title", "")[:60])
 
                 # 寸法・重量・HS推定
+                # ★2026/08/04確定: 重量はeBay実データ(Shipping Policy名)を最優先で使う。
+                #   タイトルキーワード推定は寸法(長さ幅高さ)にのみ使い、重量はフォールバック時のみ使用する。
                 dims = dimension_weight_lookup.lookup_dimensions_weight(order.get("title", ""))
                 hs_code = hs_code_lookup.lookup_hs_code(order.get("title", ""))
-                print("  推定: " + dims["category"] + " / HS=" + hs_code)
+
+                ebay_weight_kg, weight_source, weight_err = get_ebay_shipping_weight_kg(
+                    order.get("item_id", ""))
+                if ebay_weight_kg:
+                    dims["weight_kg"] = ebay_weight_kg
+                    print("  推定: " + dims["category"] + " / HS=" + hs_code +
+                          " / 重量=" + str(ebay_weight_kg) + "kg [eBay実データ: " + weight_source + "]")
+                else:
+                    weight_source = "keyword_fallback"
+                    print("  推定: " + dims["category"] + " / HS=" + hs_code +
+                          " / 重量=" + str(dims["weight_kg"]) + "kg " +
+                          "[★eBay実データ取得失敗→タイトル推定にフォールバック: " + str(weight_err) + "]")
 
                 # ★ 前の注文の残存ダイアログ（外側編集ダイアログ含む）を確実に閉じる
                 # ★2026/07/06: ここが不十分だと次注文の編集ボタンクリック後に
@@ -1661,6 +1819,7 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                     "title": order.get("title", ""),
                     "item_id": order.get("item_id", ""),
                     "weight_kg": dims["weight_kg"],
+                    "weight_source": weight_source,
                     "dims": [dims["length_cm"], dims["width_cm"], dims["height_cm"]],
                     "hs_code": hs_code,
                 }
