@@ -64,6 +64,16 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           VERIFY_ORDER_NOS: ${{ github.event.inputs.verify_order_nos }}
+          # ★2026/08/04追加: DHL見積もり用の重量をeBay実データ(Shipping Policy名)から
+          #   取得するために必要（cpass_workflow.py get_ebay_shipping_weight_kg）。
+          #   タスク1(ebay-restock)・タスク5(ebay-auto-reply)と同じ値をこのリポジトリの
+          #   Secretsにも登録すること。未設定でもエラーにはならずタイトル推定に
+          #   フォールバックするが、重量精度の改善効果が得られない。
+          APP_ID: ${{ secrets.APP_ID }}
+          DEV_ID: ${{ secrets.DEV_ID }}
+          CERT_ID: ${{ secrets.CERT_ID }}
+          TSUJOU_TOKEN: ${{ secrets.TSUJOU_TOKEN }}
+          SENMON_TOKEN: ${{ secrets.SENMON_TOKEN }}
         run: python daily_workflow_ga.py
 
       # ★2026/07/05追加: 調査用にスクリーンショット等をArtifactsへ保存（失敗時も）
