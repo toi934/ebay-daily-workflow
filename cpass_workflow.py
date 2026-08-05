@@ -56,7 +56,12 @@ import dimension_weight_lookup
 
 TRADING_API_URL = "https://api.ebay.com/ws/api.dll"
 TRADING_NS = {"e": "urn:ebay:apis:eBLBaseComponents"}
-_SHIP_PROFILE_WEIGHT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*kg", re.IGNORECASE)
+_SHIP_PROFILE_WEIGHT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:kg|㎏)", re.IGNORECASE)
+# ★2026/08/05確定: 実際のShipping Policy名は半角"kg"ではなく全角キログラム記号
+#   "㎏"(U+338F)1文字が使われているケースがほとんどだった（診断スクリプトdiag_weight_check.pyで
+#   直近48時間の実注文15件全件を検証し確認）。旧正規表現は半角"kg"のみ一致する作りだったため
+#   15件全件で一致せず、8/4の修正は一度も実際には効いておらず旧来のタイトルキーワード推定に
+#   毎回フォールバックしていた（戸井さん指摘「昨日と同じ」の直接の原因）。
 
 _GA_ACCOUNTS = {
     "tsujou": {
