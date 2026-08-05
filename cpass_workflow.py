@@ -138,7 +138,17 @@ def get_ebay_shipping_weight_kg(item_id, account_name=None):
         return None, "none", "GetItem HTTP " + str(resp.status_code)
 
     try:
-        root = ET.fromstring(resp.text)
+        # ★2026/08/05確定: resp.text ではなく resp.content(生バイト)を渡すこと。
+        #   eBay GetItemのレスポンスヘッダはcharsetを明示しないことがあり、その場合
+        #   requestsはRFC2616のデフォルトに従いISO-8859-1と誤って推測してresp.textを
+        #   デコードしてしまう。実際のXML本文はUTF-8（"㎏"等の全角文字を含む）のため、
+        #   resp.textを使うと文字化け（例: "㎏"→"ã\x8e\x8f"）した文字列がXMLパース後の
+        #   値にそのまま残ってしまい、後段の正規表現(_SHIP_PROFILE_WEIGHT_RE)が絶対に
+        #   一致しなくなっていた（診断スクリプトdiag_weight_check.pyで実注文15件全件が
+        #   この文字化けで重量取得失敗することを確認・再現済み）。resp.content(bytes)を
+        #   渡せばElementTreeがXML宣言の encoding="utf-8" を正しく使ってパースするため、
+        #   文字化けせず正しい文字列が得られる。
+        root = ET.fromstring(resp.content)
     except Exception as e:
         return None, "none", "GetItemレスポンス解析エラー: " + str(e)[:150]
 
