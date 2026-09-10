@@ -64,28 +64,30 @@ def get_or_create_test_subfolder(service, prod_folder_id):
     return created["id"], True
 
 
-def get_or_create_test_copy(service, test_folder_id, prod_folder_id):
+def find_test_copy(service, test_folder_id):
+    """テスト専用サブフォルダ内のテストコピーを探す。
+
+    ★重要: サービスアカウントには独自のDriveストレージ容量が無いため、
+    Drive API の files.copy / files.create で新規ファイル(実体)を作ることはできない
+    (storageQuotaExceeded)。そのためテストコピーは、実際にDriveの保存容量を持つ
+    人間のアカウント側(マイドライブ同期などファイルシステム経由)で事前に配置して
+    もらう/配置しておく必要がある。このファイルは既存の本番ファイルをコピーしたもので
+    あり、以降はサービスアカウントの書き込み権限(親フォルダから継承)で
+    download/update するだけなので、それ自体はストレージ容量を消費しない。
+    """
     q = f"'{test_folder_id}' in parents and name contains '{TEST_FILE_PREFIX}' and trashed=false"
     resp = service.files().list(q=q, fields="files(id,name,modifiedTime)",
                                  orderBy="modifiedTime desc").execute()
     files = resp.get("files", [])
-    if files:
-        log(f"既存テストコピーを再利用: {files[0]['name']} (id={files[0]['id']})")
-        return files[0]["id"], files[0]["name"], False
-
-    prod_files = ga._list_xlsm_files(service, prod_folder_id, "通常")
-    if not prod_files:
-        raise RuntimeError("本番『通常』xlsmが見つかりません")
-    prod = prod_files[0]
-    log(f"[READ-ONLY] コピー元本番ファイル: {prod['name']} (id={prod['id']}, "
-        f"modifiedTime={prod['modifiedTime']})")
-
-    test_name = f"{TEST_FILE_PREFIX}{time.strftime('%Y%m%d_%H%M%S')}.xlsm"
-    copied = service.files().copy(
-        fileId=prod["id"], body={"name": test_name, "parents": [test_folder_id]}
-    ).execute()
-    log(f"Drive側サーバーコピー作成完了(本番ファイルは未変更): {test_name} (id={copied['id']})")
-    return copied["id"], test_name, True
+    if not files:
+        raise RuntimeError(
+            f"テスト専用サブフォルダ『{TEST_SUBFOLDER_NAME}』内に "
+            f"'{TEST_FILE_PREFIX}' で始まるテストコピーが見つかりません。"
+            "(サービスアカウントはDriveストレージ容量を持たないため、"
+            "このテストコピー自体は人間のアカウント側で事前に配置する必要があります)"
+        )
+    log(f"テストコピーを検出: {files[0]['name']} (id={files[0]['id']})")
+    return files[0]["id"], files[0]["name"]
 
 
 def _shipping_empty(v):
@@ -216,14 +218,14 @@ def main():
         log(f"    {f['name']} (id={f['id']}, modifiedTime={f['modifiedTime']})")
 
     test_folder_id, folder_created = get_or_create_test_subfolder(service, prod_folder_id)
-    test_file_id, test_file_name, file_created = get_or_create_test_copy(
-        service, test_folder_id, prod_folder_id
-    )
+    test_file_id, test_file_name = find_test_copy(service, test_folder_id)
     assert test_file_id not in prod_ids, "重大な設定ミス: テストfile_idが本番file_idと一致しています"
 
     chosen_summary = []
-    if file_created:
-        local_path = fresh_download(service, test_file_id, test_file_name, "setup")
+    local_path = fresh_download(service, test_file_id, test_file_name, "setup-check")
+    existing_targets = ga.get_target_orders(local_path)
+    if not existing_targets:
+        log("対象注文(送料空欄)が0件 → 未セットアップと判断し、末尾3件を空欄化します")
         chosen, sheet_name, ship_col_idx = select_targets_for_blanking(local_path, n=3)
         log(f"送料空欄化対象として選定した{len(chosen)}件(末尾の送料記入済み行):")
         for c in chosen:
@@ -233,7 +235,8 @@ def main():
         ga._upload_xlsm(service, test_file_id, local_path)
         log("空欄化後のテストコピーをGoogle Driveへアップロード完了(セットアップ完了)")
     else:
-        log("既存のテストコピーを再利用するため、空欄化セットアップはスキップ")
+        log(f"既にセットアップ済み(対象{len(existing_targets)}件が検出された)のため、空欄化はスキップ: "
+            f"{sorted(existing_targets)}")
 
     # ── 1回目の"起動": 1件だけ処理して正常終了 ──
     result_run1 = run_pass(service, test_file_id, test_file_name, order_limit=1,
