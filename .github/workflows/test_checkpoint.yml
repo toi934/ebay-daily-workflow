@@ -1,0 +1,38 @@
+name: "[テスト専用] チェックポイント隔離検証"
+
+# ★2026/09/10追加。本番の daily_workflow.yml とは完全に別のワークフローファイル。
+# schedule トリガーは無し（workflow_dispatchのみ・手動実行のみ）。
+# 本番の「売上管理表」Driveフォルダ・CPaSS・Playwrightには一切アクセスしない
+# （test_checkpoint_isolated.py 側でテスト専用フォルダ・テスト専用ファイルのみを参照し、
+#   cpass_workflowはダミーモジュールとして扱うためCPaSSログインも発生しない）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_order_limit:
+        description: "今回処理する対象注文数の上限（空なら対象全件を処理）"
+        required: false
+        default: ""
+
+jobs:
+  test-checkpoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies (Google Drive APIのみ。Playwright/CPaSS関連は一切インストールしない)
+        run: pip install google-auth google-api-python-client openpyxl
+
+      - name: Run isolated checkpoint test (テスト専用フォルダ・テスト専用ファイルのみ操作)
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TEST_ORDER_LIMIT: ${{ github.event.inputs.test_order_limit }}
+        run: python test_checkpoint_isolated.py
