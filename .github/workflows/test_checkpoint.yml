@@ -1,23 +1,25 @@
 name: "[テスト専用] チェックポイント隔離検証"
 
-# ★2026/09/10追加。本番の daily_workflow.yml とは完全に別のワークフローファイル。
+# ★2026/09/10-11 更新。本番の daily_workflow.yml とは完全に別のワークフローファイル。
 # schedule トリガーは無し（workflow_dispatchのみ・手動実行のみ）。
-# 本番の「売上管理表」Driveフォルダ・CPaSS・Playwrightには一切アクセスしない
-# （test_checkpoint_isolated.py 側でテスト専用フォルダ・テスト専用ファイルのみを参照し、
-#   cpass_workflowはダミーモジュールとして扱うためCPaSSログインも発生しない）。
+# 本番の「売上管理表」Driveフォルダへの書き込みは一切行わない。
+# 唯一の接点は (1) フォルダID検索 (2) 最新の本番xlsm一覧取得（どちらも読み取り専用）と、
+# Drive API files.copy によるサーバー側コピー作成（元ファイルは変更されない）のみ。
+# 以降のダウンロード・書き込み・アップロードはすべて「売上管理表」フォルダ直下に
+# 新規作成するテスト専用サブフォルダ内のコピーに対してのみ行う。
+# CPaSS・Playwrightは一切呼び出さない（cpass_workflowはダミーモジュールとして扱うため
+# CPaSSログインも発生しない）。
+#
+# run_test.py が1回の実行の中で「1件処理→保存→正常終了」→「再度Driveから読み直して
+# 再開・スキップ確認→残り処理」→「最終確認」までを一気通貫で行う。
 
 on:
   workflow_dispatch:
-    inputs:
-      test_order_limit:
-        description: "今回処理する対象注文数の上限（空なら対象全件を処理）"
-        required: false
-        default: ""
 
 jobs:
   test-checkpoint:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -31,8 +33,15 @@ jobs:
       - name: Install dependencies (Google Drive APIのみ。Playwright/CPaSS関連は一切インストールしない)
         run: pip install google-auth google-api-python-client openpyxl
 
-      - name: Run isolated checkpoint test (テスト専用フォルダ・テスト専用ファイルのみ操作)
+      - name: Run isolated checkpoint test (テスト専用サブフォルダ・テスト専用コピーのみ操作)
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          TEST_ORDER_LIMIT: ${{ github.event.inputs.test_order_limit }}
-        run: python test_checkpoint_isolated.py
+        run: python run_test.py
+
+      - name: Upload result JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-test-result
+          path: result_full.json
+          if-no-files-found: ignore
