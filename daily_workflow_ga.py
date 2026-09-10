@@ -10,6 +10,16 @@
   CPASS_EMAIL / CPASS_PASSWORD
   GOOGLE_SERVICE_ACCOUNT_JSON
   GMAIL_APP_PASSWORD
+
+★2026/09/10変更（GitHub Actions 60分タイムアウト対策）:
+旧方式は「全注文のCPaSS処理が完了してからまとめてExcel書き込み・Drive UL」だったため、
+60分タイムアウトでジョブがKillされるとそのRunの成果が100%失われていた（9/8・9/9・9/10と
+3日連続で発生、約160件のバックログが一切進まない状態になっていた）。
+→ 1件（またはCHECKPOINT_EVERY_N件）処理するたびにExcel書き込み→Google Driveへ途中保存する
+  方式に変更。次回起動時は get_target_orders() の「送料セル空白」スキャンが自動的に
+  処理済み注文をスキップするため、追加の状態ファイルなしで再開できる。
+  さらに cpass_workflow.process_all_orders_for_dhl() に deadline_ts を渡し、
+  60分上限に近づいたら新規注文の処理を開始せず安全に打ち切ってもらう（[SAFE STOP]）。
 """
 
 import sys
@@ -48,8 +58,17 @@ import cpass_workflow
 E_COL_VALUE = "③マーキング番号、リサーチ者記入"
 F_COL_VALUE = "仕入未"
 EXCHANGE_RATE_KEYWORDS = ["為替", "為"]
+
+# ★2026/09/06追加: シート再構成でBL固定列と実際のヘッダー位置がズレる問題が発覚したため、
+# 為替列と同様「国際送料」ヘッダーを動的に探す方式に変更（見つからない場合のみ旧BL/BR固定にフォールバック）。
+SHIPPING_HEADER_KEYWORDS = ["国際送料"]
 DRIVE_FOLDER_NAME = "売上管理表"
 GMAIL_FROM = "gen7m9@gmail.com"
+
+# ★2026/09/10追加: 途中保存(チェックポイント)関連のデフォルト設定。
+# どちらも環境変数で上書き可能（テスト時などに調整しやすいように）。
+DEFAULT_SAFETY_BUDGET_SECONDS = 2700  # 45分（60分上限に対して15分のバッファ）
+DEFAULT_CHECKPOINT_EVERY_N = 1        # 1件処理するごとに保存（最も安全）
 
 
 # ─── Google Drive API ───
@@ -195,11 +214,33 @@ def find_exchange_cols(ws):
     return found
 
 
+def find_shipping_column(ws, xlsm_path):
+    """国際送料の列を探す（ヘッダー行から「国際送料」キーワード、優先）。
+
+    ★2026/09/06追加: シート再構成で「国際送料」ヘッダーの実際の位置が従来の固定列
+    (通常=BL/専門=BR)からズレる事例が発覚したため、為替列と同じ方式（ヘッダー文字列を
+    動的に探す）に変更した。ヘッダーが見つからない場合のみ従来の固定列にフォールバックする。
+    """
+    for row in range(1, 4):
+        for col in range(1, ws.max_column + 1):
+            val = ws.cell(row=row, column=col).value
+            if val and isinstance(val, str) and any(kw in val for kw in SHIPPING_HEADER_KEYWORDS):
+                return col
+    fallback_letter = get_shipping_col(xlsm_path)
+    print(f"  [WARN] 「国際送料」ヘッダーが見つからず、従来の固定列({fallback_letter})にフォールバック")
+    return openpyxl.utils.column_index_from_string(fallback_letter)
+
+
 def get_target_orders(xlsm_path):
-    """BL/BR空白の新規注文番号セットを返す"""
+    """BL/BR空白の新規注文番号セットを返す
+
+    ★このスキャン方式は変更していない。GitHub Actions版の途中保存(チェックポイント)機構は、
+    このxlsmファイル自体をこまめに保存することで成立している。つまり:
+      - 実行中にチェックポイント保存された注文 → 次回この関数を呼んだ時点で
+        既に送料セルが埋まっている → targetsから自動的に除外される（＝再開・重複防止）。
+    追加の状態ファイル(「何件目まで処理済み」等)を持たない設計。
+    """
     order_pattern = re.compile(r"^\d{2}-\d{5}-\d{5}$")
-    shipping_col = get_shipping_col(xlsm_path)
-    ship_col_idx = openpyxl.utils.column_index_from_string(shipping_col)
 
     wb = openpyxl.load_workbook(xlsm_path, keep_vba=True, data_only=True)
     sheet_name = find_sheet_with_orders(wb)
@@ -207,6 +248,8 @@ def get_target_orders(xlsm_path):
         wb.close()
         return set()
     ws = wb[sheet_name]
+    ship_col_idx = find_shipping_column(ws, xlsm_path)
+    shipping_col = openpyxl.utils.get_column_letter(ship_col_idx)
 
     def _shipping_empty(v):
         # ★2026/07/03修正: None/空文字だけでなく 0・空白文字列・数式の空結果も「未記入」扱い
@@ -258,14 +301,18 @@ def get_target_orders(xlsm_path):
 
 
 def process_xlsm(xlsm_path, cpass_results, dry_run=False):
-    """xlsmを開いてCPaSSデータで空白セルを埋め、openpyxlで保存"""
+    """xlsmを開いてCPaSSデータで空白セルを埋め、openpyxlで保存
+
+    ★2026/09/10変更: 戻り値を bool から (success: bool, num_writes: int) に変更。
+    呼び出し側（途中保存のチェックポイント処理）が「今回新たに書き込みが発生したか」を
+    判定できるようにするため。新規書き込みが0件ならGoogle Driveへの再アップロードを
+    スキップし、無駄なAPI呼び出し・時間消費を避ける。
+    """
     print()
     print("=" * 60)
-    print(f"Step 3: {os.path.basename(xlsm_path)}")
+    print(f"Excel処理: {os.path.basename(xlsm_path)}")
     print("=" * 60)
 
-    shipping_col = get_shipping_col(xlsm_path)
-    ship_col_idx = openpyxl.utils.column_index_from_string(shipping_col)
     order_pattern = re.compile(r"^\d{2}-\d{5}-\d{5}$")
 
     # 読み取り専用で開いてwritesを収集
@@ -274,8 +321,10 @@ def process_xlsm(xlsm_path, cpass_results, dry_run=False):
     if not sheet_name:
         print("  注文データのシートが見つかりません")
         wb.close()
-        return False
+        return False, 0
     ws = wb[sheet_name]
+    ship_col_idx = find_shipping_column(ws, xlsm_path)
+    shipping_col = openpyxl.utils.get_column_letter(ship_col_idx)
 
     ex_cols = find_exchange_cols(ws)
     writes = []
@@ -336,11 +385,11 @@ def process_xlsm(xlsm_path, cpass_results, dry_run=False):
 
     if dry_run:
         print("  [DRY RUN] 書き込みなし")
-        return True
+        return True, len(writes)
 
     if not writes:
         print("  書き込みなし（全セル埋まり済み）")
-        return True
+        return True, 0
 
     # openpyxlで書き込み（keep_vba=TrueでVBA保持）
     print(f"  openpyxl で書き込み中... ({len(writes)} セル)")
@@ -351,7 +400,7 @@ def process_xlsm(xlsm_path, cpass_results, dry_run=False):
     wb2.save(xlsm_path)
     wb2.close()
     print(f"  保存OK: {os.path.basename(xlsm_path)}")
-    return True
+    return True, len(writes)
 
 
 # ─── メール送信 ───
@@ -394,6 +443,7 @@ def _get_run_count():
 def main():
     dry_run = "--dry-run" in sys.argv
     start_time = datetime.now()
+    start_ts = time.time()
 
     print("=" * 60)
     print(f"売上管理表ワークフロー (GitHub Actions版)  {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -402,6 +452,23 @@ def main():
     run_count = _get_run_count()
     errors = []
     summary_lines = []
+
+    # ★2026/09/10追加: 途中保存(チェックポイント)関連の設定値。
+    # SAFETY_BUDGET_SECONDS: ワークフロー開始からこの秒数を過ぎたら、
+    #   cpass_workflow側に新規注文の処理開始を止めてもらう（60分ジョブ上限に対し15分の余裕）。
+    # CHECKPOINT_EVERY_N: 何件処理するごとにExcel書き込み・Drive ULを行うか（既定=1件ごと）。
+    # どちらもGitHub Actions側の環境変数で上書き可能（テスト時などに調整するため）。
+    try:
+        SAFETY_BUDGET_SECONDS = int(os.environ.get("SAFETY_BUDGET_SECONDS", str(DEFAULT_SAFETY_BUDGET_SECONDS)))
+    except ValueError:
+        SAFETY_BUDGET_SECONDS = DEFAULT_SAFETY_BUDGET_SECONDS
+    try:
+        CHECKPOINT_EVERY_N = max(1, int(os.environ.get("CHECKPOINT_EVERY_N", str(DEFAULT_CHECKPOINT_EVERY_N))))
+    except ValueError:
+        CHECKPOINT_EVERY_N = DEFAULT_CHECKPOINT_EVERY_N
+    deadline_ts = start_ts + SAFETY_BUDGET_SECONDS
+    print(f"  安全停止デッドライン: 開始から{SAFETY_BUDGET_SECONDS}秒後 "
+          f"/ チェックポイント間隔: {CHECKPOINT_EVERY_N}件ごと")
 
     with tempfile.TemporaryDirectory() as workdir:
         # Step 1: Google Drive からDL
@@ -448,40 +515,98 @@ def main():
             print(f"  [検証モード] VERIFY_ORDER_NOS指定あり → 対象を{_before}件から"
                   f"{len(target_order_nos)}件に制限: {sorted(target_order_nos)}")
 
-        # Step 3: CPaSS処理
+        # ─── 途中保存(チェックポイント)まわりの状態 ───
+        # ★2026/09/10追加: cpass_results はCPaSS処理の進行に応じて逐次このdictへ反映され、
+        # process_xlsm() へ渡すたびに「その時点までに取得できた送料」でExcelへ書き込む。
         cpass_results = {}
+        checkpoint_state = {"since_last_save": 0, "saved_total": 0, "pending_orders": [], "last_error": None}
+
+        def _do_checkpoint(reason):
+            """現時点のcpass_resultsで対象xlsmへ書き込み→Google Driveへ途中保存する。"""
+            pending = list(checkpoint_state["pending_orders"])
+            any_saved = False
+            for _prefix, (_local_path, _file_id) in xlsm_paths.items():
+                try:
+                    ok, num_writes = process_xlsm(_local_path, cpass_results, dry_run=dry_run)
+                    if ok and num_writes > 0 and not dry_run:
+                        _upload_xlsm(service, _file_id, _local_path)
+                        any_saved = True
+                        print(f"  [CHECKPOINT] {_prefix}: {num_writes}セル保存 "
+                              f"対象注文={pending} → Google Driveアップロード成功 ({reason})")
+                    elif ok and num_writes == 0:
+                        print(f"  [CHECKPOINT] {_prefix}: 新規書き込みなし、ULスキップ ({reason})")
+                except Exception as e:
+                    msg = f"{_prefix}のチェックポイント保存失敗: {e}"
+                    print(f"  [WARN] {msg}")
+                    checkpoint_state["last_error"] = msg
+            checkpoint_state["pending_orders"] = []
+            return any_saved
+
+        def _on_order_done(order_no, info, idx, total):
+            """cpass_workflow側から1注文の処理が終わるたびに呼ばれるコールバック。"""
+            cpass_results[order_no] = info
+            checkpoint_state["since_last_save"] += 1
+            checkpoint_state["saved_total"] += 1
+            checkpoint_state["pending_orders"].append(order_no)
+            print(f"  [CHECKPOINT] {idx}/{total}件目まで処理済み: 対象注文={order_no} "
+                  f"送料={info.get('dhl_price_jpy')}")
+            if checkpoint_state["since_last_save"] >= CHECKPOINT_EVERY_N:
+                _do_checkpoint(f"{idx}/{total}件目時点")
+                checkpoint_state["since_last_save"] = 0
+
+        # Step 3: CPaSS処理（1件ごとに _on_order_done で途中保存）
         # ★2026/07/09修正: 対象0件でも「発送手続き待ち→発送手続き」への移動は必ず実行する。
         # 旧コードは target_order_nos が空だとCPaSS処理自体を丸ごとスキップしており、
         # 物理的な出荷キューが「発送手続き待ち」に滞留し続ける原因になっていた。
         if not dry_run:
             print()
             print("=" * 60)
-            print("Step 2: CPaSS ワークフロー実行")
+            print("Step 2: CPaSS ワークフロー実行（1件ごとに途中保存 / 安全停止あり）")
             print("=" * 60)
             try:
-                cpass_results = cpass_workflow.process_all_orders_for_dhl(
+                _cpass_final = cpass_workflow.process_all_orders_for_dhl(
                     target_order_nos=target_order_nos,
                     headless=True,
                     move_waiting=True,
+                    on_order_done=_on_order_done,
+                    deadline_ts=deadline_ts,
                 )
+                if _cpass_final:
+                    # cpass_workflow側の最終dictで念のため同期（_on_order_doneで既に
+                    # ほぼ同内容がcpass_resultsに入っているはずだが、取りこぼし防止の保険）。
+                    cpass_results.update(_cpass_final)
                 ok_count = sum(1 for v in cpass_results.values() if v.get("dhl_price_jpy"))
                 summary_lines.append(f"CPaSS: {ok_count}/{len(target_order_nos)}件 DHL金額取得")
+                if len(cpass_results) < len(target_order_nos):
+                    remaining = len(target_order_nos) - len(cpass_results)
+                    summary_lines.append(f"未処理のまま残: {remaining}件（次回自動継続）")
             except Exception as e:
                 msg = f"CPaSS処理エラー: {e}"
                 print(msg)
                 errors.append(msg)
 
-        # Step 4: Excelに書き込み → Google Driveにアップロード
+        # Step 4: 最終フラッシュ
+        # CHECKPOINT_EVERY_N=1（既定）なら基本的にここで新規書き込みは発生しないはずだが、
+        # CHECKPOINT_EVERY_N>1設定時の端数や、コールバック失敗時の取りこぼしに対する保険として残す。
+        if checkpoint_state["pending_orders"] or checkpoint_state["last_error"]:
+            _do_checkpoint("最終フラッシュ前の残チェックポイント")
         for prefix, (local_path, file_id) in xlsm_paths.items():
             try:
-                ok = process_xlsm(local_path, cpass_results, dry_run=dry_run)
-                if ok and not dry_run:
+                ok, num_writes = process_xlsm(local_path, cpass_results, dry_run=dry_run)
+                if ok and num_writes > 0 and not dry_run:
                     _upload_xlsm(service, file_id, local_path)
-                    summary_lines.append(f"{prefix}: 書き込み・UL完了")
+                    summary_lines.append(f"{prefix}: 最終フラッシュ {num_writes}セル 保存・UL完了")
+                elif ok:
+                    summary_lines.append(f"{prefix}: 保存・UL完了（途中保存済み、追加分なし）")
             except Exception as e:
                 msg = f"{prefix}の処理失敗: {e}"
                 print(msg)
                 errors.append(msg)
+
+        summary_lines.append(
+            f"途中保存(チェックポイント): 累計{checkpoint_state['saved_total']}件処理 "
+            f"/ 安全停止デッドライン{SAFETY_BUDGET_SECONDS}秒"
+        )
 
     end_time = datetime.now()
     elapsed = int((end_time - start_time).total_seconds())

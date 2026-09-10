@@ -1688,7 +1688,8 @@ def _move_single_order_to_processing(page, order_no):
     return False
 
 
-def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiting=True):
+def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiting=True,
+                                on_order_done=None, deadline_ts=None):
     """「発送手続き待ち」で各注文を編集→DHL取得→発送手続きへ移動
 
     修正版: 編集ダイアログは「発送手続き待ち」タブにのみ存在する。
@@ -1699,9 +1700,29 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
         target_order_nos: 処理対象の注文番号リスト（None なら全件）
         headless: ブラウザ非表示モード
         move_waiting: True なら編集後に発送手続きへ移動する（False=編集のみ）
+        on_order_done: ★2026/09/10追加（タスク2 GitHub Actions版 恒久修正）。
+            1件の注文処理が完了するたびに呼ばれるコールバック。
+            シグネチャ: on_order_done(order_no, info, idx, total) -> None
+              - order_no: 処理した注文番号
+              - info: results[order_no] と同じ内容の dict
+              - idx: 何件目の処理か（1始まり）
+              - total: 今回の対象総件数
+            呼び出し側（daily_workflow_ga.py）はこれを使って1件ごとに
+            Excel書き込み＋Google Driveアップロードを行い、GitHub Actionsが
+            タイムアウトで強制終了しても処理済み分が失われないようにする。
+            コールバック内で例外が発生しても、CPaSS処理自体は継続する
+            （ログにWARNを出すのみ）。
+        deadline_ts: ★2026/09/10追加。time.time()形式のUNIXタイムスタンプ。
+            指定した場合、各注文の処理を開始する直前にこの時刻を過ぎていないか
+            確認し、過ぎていれば無理に次の注文へ進まず、ここまでの結果を
+            返して安全に終了する（GitHub Actionsの60分上限で強制キャンセル
+            される前に、自分から安全に処理を打ち切るための仕組み）。
 
     Returns:
         dict: {order_no: {package_no, dhl_price_jpy, title, item_id}}
+        （すべて処理できた場合も、deadline_tsで途中打ち切りした場合も、
+        　それまでに完了した分がここに入る。on_order_doneを渡していれば
+        　個々の注文の結果はそちらで既に保存済みのはず）
     """
     from playwright.sync_api import sync_playwright
 
@@ -1784,6 +1805,16 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
 
             # 各注文を処理（待ちタブで編集 → 発送手続きへ移動）
             for idx, order in enumerate(orders):
+                # ★2026/09/10追加: 次の注文に着手する前に制限時間を確認。
+                # 超えていれば無理に進めず、ここまでの結果を返して安全に終了する。
+                if deadline_ts is not None and time.time() >= deadline_ts:
+                    remaining = len(orders) - idx
+                    print()
+                    print("[SAFE STOP] 制限時間に近づいたため注文処理を安全に打ち切ります"
+                          " (" + str(idx) + "/" + str(len(orders)) + "件処理済み、残り"
+                          + str(remaining) + "件は次回実行時に自動的に継続されます)")
+                    break
+
                 print()
                 print("--- [" + str(idx + 1) + "/" + str(len(orders)) +
                       "] order=" + order["order_no"] + " pkg=" + order["package_no"] + " ---")
@@ -1840,6 +1871,17 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                 }
 
                 # 発送手続きタブで処理済みのため移動不要
+
+                # ★2026/09/10追加: 1件処理完了ごとに呼び出し側へ通知。
+                # ここでExcel書き込み＋Google Driveアップロードまで完了させることで、
+                # この直後にGitHub Actionsがタイムアウトで落ちても、この注文分は失われない。
+                if on_order_done is not None:
+                    try:
+                        on_order_done(order["order_no"], results[order["order_no"]],
+                                      idx + 1, len(orders))
+                    except Exception as _cb_err:
+                        print("  [WARN] on_order_doneコールバックでエラー(処理は継続します): "
+                              + str(_cb_err)[:200])
 
                 time.sleep(2)
 
