@@ -241,13 +241,35 @@ def main():
 
     setup_path = fresh_download(service, test_file_id, test_file_name, "setup-check")
     initial_targets = ga.get_target_orders(setup_path)
-    log(f"検証開始時点の対象注文(行番号昇順であるはず): {initial_targets}")
     expected_order = ["07-15147-67281", "01-15163-10197", "05-15156-05008"]
-    assert initial_targets == expected_order, (
-        f"対象注文が行番号昇順で返っていません(期待={expected_order}, 実際={initial_targets})。"
+    log(f"検証開始時点の対象注文: 全{len(initial_targets)}件"
+        f"(このテストコピーには元々、今回の3件とは無関係な未処理注文が多数存在する。"
+        f"これは本番同様の実データコピーのため。テスト対象はあくまで末尾の3件)")
+    log(f"検証開始時点の対象注文(先頭10件のみ表示): {initial_targets[:10]}")
+
+    # ★2026/09/10 修正: このテストコピーは本番同様の実データ(499件)のコピーであり、
+    # 全行スキャン化した修正版get_target_orders()は、今回のテスト対象3件とは無関係な
+    # 「もともと送料未記入だった注文」も多数(数百件規模)検出する。これは修正が正しく
+    # 機能している証拠であり(旧バグはこれらを不可視化していた)、バグではない。
+    # そのため「listが完全に3件と一致する」ではなく、以下の2点を厳密に検証する:
+    #   (a) テスト対象3件が、行番号の昇順どおり「末尾3件」として現れる
+    #   (b) キャンセル行・既存送料記入済み行(ガード行)の注文番号が対象に紛れ込んでいない
+    assert initial_targets[-3:] == expected_order, (
+        f"テスト対象3件が期待した行番号昇順で末尾に現れていません"
+        f"(期待=末尾{expected_order}, 実際の末尾3件={initial_targets[-3:]})。"
         "get_target_orders()の修正に問題がある可能性があります。"
     )
-    log("[OK] get_target_orders()は行番号の昇順でlistを返している(set()の順序不定を解消)")
+    _cancelled_order_no = "03-15155-61534"  # 行585、キャンセル
+    assert _cancelled_order_no not in initial_targets, (
+        f"[NG] キャンセル注文{_cancelled_order_no}が誤って対象に含まれています"
+    )
+    _guard_filled_order_nos = {v["order_no"] for k, v in guard_before.items() if k != 585}
+    _leaked = _guard_filled_order_nos & set(initial_targets)
+    assert not _leaked, f"[NG] 既存送料記入済みの注文が誤って対象に含まれています: {_leaked}"
+    baseline_other = initial_targets[:-3]  # 今回のテストと無関係な、もともとの未処理注文(不変であるべき)
+    log(f"[OK] テスト対象3件は行番号昇順で末尾に検出され、set()の順序不定は解消されている")
+    log(f"[OK] キャンセル行・既存送料記入済み行(ガード行)は対象に混入していない")
+    log(f"[参考] テストと無関係な既存未処理注文(このテストを通じて不変であるべき): {len(baseline_other)}件")
 
     # ── 1. わざと「行番号の大きい注文を先に保存」する最悪ケースを作る ──
     adversarial_order = initial_targets[-1]  # 05-15156-05008 (587行目、最も行番号が大きい)
@@ -259,18 +281,27 @@ def main():
     # ── 2. 修正の核心確認: 行番号の小さい未処理注文が引き続き検出されるか ──
     after_run1_path = fresh_download(service, test_file_id, test_file_name, "after-RUN1-check")
     after_run1_targets = ga.get_target_orders(after_run1_path)
-    log(f"[RUN1後の再スキャン] 対象注文: {after_run1_targets}")
+    log(f"[RUN1後の再スキャン] 対象注文: 全{len(after_run1_targets)}件(先頭10件: {after_run1_targets[:10]})")
     expected_after_run1 = ["07-15147-67281", "01-15163-10197"]
     assert adversarial_order not in after_run1_targets, (
         f"[NG] 保存済みのはずの{adversarial_order}が再び対象になっています(重複処理防止が壊れています)"
     )
-    assert after_run1_targets == expected_after_run1, (
-        f"[NG] 行番号の小さい未処理注文が取りこぼされました(期待={expected_after_run1}, "
-        f"実際={after_run1_targets})。get_target_orders()の修正が機能していません。"
+    # ★無関係な既存未処理注文(baseline_other)を含め、「今回保存した1件だけが消え、
+    # それ以外は行の並び順まで含めて一切変化していない」ことを厳密に検証する。
+    expected_full_after_run1 = [o for o in initial_targets if o != adversarial_order]
+    assert after_run1_targets == expected_full_after_run1, (
+        f"[NG] 保存した{adversarial_order}以外の対象リストに変化があります"
+        f"(期待={expected_full_after_run1[-5:]}...(末尾5件), 実際={after_run1_targets[-5:]}...(末尾5件))。"
+        "get_target_orders()の修正が機能していないか、無関係な注文に影響が出ています。"
+    )
+    assert after_run1_targets[-2:] == expected_after_run1, (
+        f"[NG] 行番号の小さい未処理注文が取りこぼされました(期待=末尾{expected_after_run1}, "
+        f"実際の末尾2件={after_run1_targets[-2:]})。get_target_orders()の修正が機能していません。"
     )
     log(f"[OK] 行番号の大きい注文({adversarial_order})を先に保存しても、"
         f"行番号の小さい未処理注文 {expected_after_run1} は取りこぼされずに検出された")
     log(f"[OK] 保存済みの{adversarial_order}は正しく対象から除外された(重複処理防止も健在)")
+    log(f"[OK] 今回のテストと無関係な既存未処理注文{len(baseline_other)}件も、並び順まで含め一切変化なし")
 
     # ── 3. 残り2件を行番号順に処理(=RUN2/再開を模す) ──
     run2_entries = []
@@ -280,9 +311,14 @@ def main():
                                    idx=idx, total=len(expected_after_run1))
         run2_entries.append(entry)
 
-    # ── 4. 最終確認: 新規DLしなおして、対象0件・全セルが正しい値か・ガード行が無事か ──
+    # ── 4. 最終確認: 新規DLしなおして、テスト対象3件が対象から消えたか・
+    #      無関係な既存未処理注文(baseline_other)は不変か・全セルが正しい値か・
+    #      ガード行が無事か ──
     final_path = fresh_download(service, test_file_id, test_file_name, "FINAL-VERIFY")
     final_targets = ga.get_target_orders(final_path)
+    _test_orders_set = set(expected_order)
+    _remaining_test_orders = [o for o in final_targets if o in _test_orders_set]
+    _final_matches_baseline = (final_targets == baseline_other)
     final_values = {}
     for order_no, info in KNOWN_ORIGINAL_VALUES.items():
         row = info["row"]
@@ -307,18 +343,28 @@ def main():
 
     result = {
         "fix_verified": {
-            "get_target_orders_returns_row_ordered_list": initial_targets == expected_order,
-            "earlier_row_order_not_orphaned_after_later_row_saved_first": after_run1_targets == expected_after_run1,
+            "get_target_orders_returns_row_ordered_list": initial_targets[-3:] == expected_order,
+            "cancelled_and_filled_orders_not_leaked_into_targets": (
+                _cancelled_order_no not in initial_targets and not _leaked
+            ),
+            "earlier_row_order_not_orphaned_after_later_row_saved_first": after_run1_targets[-2:] == expected_after_run1,
             "already_saved_order_excluded_from_rescan": adversarial_order not in after_run1_targets,
+            "unrelated_preexisting_targets_untouched_after_run1": after_run1_targets == expected_full_after_run1,
+            "all_3_test_orders_cleared_and_unrelated_backlog_untouched": (
+                not _remaining_test_orders and _final_matches_baseline
+            ),
         },
         "test_folder_name": TEST_SUBFOLDER_NAME,
         "test_file_name": test_file_name,
-        "target_3_orders_row_order": initial_targets,
+        "target_3_orders_row_order": initial_targets[-3:],
+        "unrelated_preexisting_backlog_count": len(baseline_other),
         "run1_adversarial": run1_entry,
         "run1_adversarial_order": adversarial_order,
-        "after_run1_targets": after_run1_targets,
+        "after_run1_targets_count": len(after_run1_targets),
         "run2_resume": run2_entries,
-        "final_targets_remaining": final_targets,
+        "final_targets_count": len(final_targets),
+        "final_remaining_test_orders": _remaining_test_orders,
+        "final_matches_unrelated_baseline": _final_matches_baseline,
         "final_cell_values": final_values,
         "guard_rows_before": guard_before,
         "guard_rows_after": guard_after,
@@ -337,12 +383,16 @@ def main():
     log("=" * 70)
     log(f"テストサブフォルダ: {TEST_SUBFOLDER_NAME}")
     log(f"テストファイル: {test_file_name}")
-    log(f"対象3件(行番号昇順): {initial_targets}")
+    log(f"テスト対象3件(行番号昇順、末尾に検出): {expected_order}")
+    log(f"テストと無関係な既存未処理注文(不変であるべき背景データ): {len(baseline_other)}件")
     log(f"[意図的悪条件] 先に保存した行番号最大の注文: {adversarial_order} "
         f"(ダミー送料={run1_entry['fake_price']})")
-    log(f"RUN1直後の再スキャンで検出された残り対象: {after_run1_targets} (取りこぼしなし)")
+    log(f"RUN1直後の再スキャンで検出された残り対象: 全{len(after_run1_targets)}件 (取りこぼしなし、"
+        f"無関係な既存未処理注文{len(baseline_other)}件も不変)")
     log(f"RUN2(再開)で処理: {[e['order_no'] for e in run2_entries]}")
-    log(f"最終確認後の対象注文(空欄)残数: {len(final_targets)} 件 {final_targets}")
+    log(f"最終確認後の対象注文 残数: 全{len(final_targets)}件"
+        f"(うちテスト対象3件の残り: {_remaining_test_orders} / 0件であるべき)")
+    log(f"最終確認後、テストと無関係な既存未処理注文は完全一致で不変か = {_final_matches_baseline}")
     log(f"最終セル値: {json.dumps(final_values, ensure_ascii=False, default=str)}")
     log(f"ガード行(既存送料記入済み・キャンセル行)が無変更か = {guard_unchanged}")
     if not guard_unchanged:
@@ -355,9 +405,11 @@ def main():
 
     all_ok = (
         result["fix_verified"]["get_target_orders_returns_row_ordered_list"]
+        and result["fix_verified"]["cancelled_and_filled_orders_not_leaked_into_targets"]
         and result["fix_verified"]["earlier_row_order_not_orphaned_after_later_row_saved_first"]
         and result["fix_verified"]["already_saved_order_excluded_from_rescan"]
-        and len(final_targets) == 0
+        and result["fix_verified"]["unrelated_preexisting_targets_untouched_after_run1"]
+        and result["fix_verified"]["all_3_test_orders_cleared_and_unrelated_backlog_untouched"]
         and guard_unchanged
         and prod_unchanged
     )
