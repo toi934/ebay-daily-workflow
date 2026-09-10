@@ -57,7 +57,31 @@ def main():
     print(f"[TEST] TEST_ORDER_LIMIT={ORDER_LIMIT}")
     print("=" * 60)
 
+    # ★診断用: サービスアカウントのメールアドレスを表示（秘密鍵は表示しない）。
+    # テスト用フォルダがサービスアカウントに共有されていない可能性の切り分けのため。
+    try:
+        _sa_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+        print(f"[TEST][DEBUG] サービスアカウントのメールアドレス: {_sa_info.get('client_email')}")
+    except Exception as _e:
+        print(f"[TEST][DEBUG] サービスアカウント情報の読み取りに失敗: {_e}")
+
     service = ga._get_drive_service()
+
+    # ★診断用: サービスアカウントが「見える」フォルダを一覧表示（本番「売上管理表」フォルダが
+    # そもそも見えているか、テスト用フォルダとの違いを確認するため）。
+    try:
+        _folders = service.files().list(
+            q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+            fields="files(id,name,owners(emailAddress))",
+            pageSize=50,
+        ).execute().get("files", [])
+        print(f"[TEST][DEBUG] サービスアカウントから見えるフォルダ一覧({len(_folders)}件):")
+        for _f in _folders:
+            _owners = ",".join(o.get("emailAddress", "?") for o in _f.get("owners", []))
+            print(f"    - {_f['name']} (id={_f['id']}, owner={_owners})")
+    except Exception as _e:
+        print(f"[TEST][DEBUG] フォルダ一覧取得に失敗: {_e}")
+
     folder_id = ga._find_folder_id(service, TEST_FOLDER_NAME)
     print(f"[TEST] テストフォルダID: {folder_id}")
 
