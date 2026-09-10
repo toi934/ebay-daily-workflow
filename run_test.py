@@ -1,18 +1,29 @@
-"""チェックポイント機構の隔離検証(単発の実行で "1件目→保存" → "再起動→スキップ→残り処理" まで
-一気に検証する版)。
+"""チェックポイント機構 + get_target_orders()修正 の隔離検証(単発の実行で完結)。
 
-本番daily_workflow_ga.py(GitHub Actions版の実物)の関数をそのままimportし、実際のサービス
-アカウント・実際のGoogle Drive APIに対して動作させる。CPaSS/Playwrightは一切呼び出さない
-(cpass_workflowはダミーモジュールとしてsys.modulesに登録)。
+★2026/09/10 Run#5の結果、get_target_orders()の「送料記入済み最終行より後ろだけ
+スキャンする」ロジックに不具合があることが判明した: 1回の実行で複数件処理する際、
+行番号が大きい注文が先にチェックポイント保存されると、まだ未処理のまま残っている
+「行番号が小さい注文」が次回スキャンで検出されなくなる(エラーも出ずに永久に
+取りこぼされる)。daily_workflow_ga.py の get_target_orders() をシート全体スキャン
+方式に修正し(★2026/09/10 追加修正、を参照)、対象注文をCPaSSへ渡す順序も
+行番号昇順のlistに変更した。
+
+本スクリプトはその修正を検証する。わざと「行番号の大きい注文を先に保存」という
+最悪ケースを人為的に作り、それでも行番号の小さい注文が次回スキャンで確実に
+検出されること・保存済み注文が再処理されないこと・最終的に全件処理されること・
+キャンセル注文や既存の送料記入済み注文が誤って触られていないこと・本番ファイルが
+一切変更されていないことを確認する。
+
+本番daily_workflow_ga.py(GitHub Actions版の実物)の関数をそのままimportし、実際の
+サービスアカウント・実際のGoogle Drive APIに対して動作させる。CPaSS/Playwrightは
+一切呼び出さない(cpass_workflowはダミーモジュールとしてsys.modulesに登録)。
 
 安全設計:
 - 本番「売上管理表」フォルダへの書き込みは一切行わない。読み取り専用で
   (1) フォルダID検索 (2) 最新の本番xlsmファイル一覧取得 の2箇所だけ参照する。
-- 本番xlsmファイルへの唯一の操作は Drive API の files.copy (サーバー側コピー)。
-  これは新しい別ファイルを作るだけで、元ファイルには一切触れない。
-- 以降のダウンロード・書き込み・アップロードは、すべてこのコピー(テスト専用サブ
-  フォルダ内)に対してのみ行う。production file_id を _upload_xlsm に渡すコードパスは
-  存在しない(アサーションで二重に保証)。
+- 以降のダウンロード・書き込み・アップロードは、すべてテスト専用サブフォルダ内の
+  テストコピーに対してのみ行う。production file_id を _upload_xlsm に渡すコード
+  パスは存在しない(アサーションで二重に保証)。
 - 送料はダミー値を書き込む。CPaSSは一切呼び出さない。
 - "再起動後の再開"は、実際にDriveへ再アップロードしたテストコピーを毎回あらためて
   ダウンロードし直すことでシミュレートする(本物のGitHub Actionsの2回目の実行と
@@ -43,6 +54,18 @@ TEST_FILE_PREFIX = "TEST_チェックポイント検証_"
 
 ORDER_PATTERN = re.compile(r"^\d{2}-\d{5}-\d{5}$")
 FAKE_PRICE_BASE = 99990
+
+# ★前回(Run#5)セットアップ時に記録した、対象3件の元の値(このテストコピー内のみ)。
+# 今回はこの既知の値へ一旦リストアしてから空欄化することで、前回(修正前コードでの)
+# 実行結果を引きずらないクリーンな状態から検証する。
+KNOWN_ORIGINAL_VALUES = {
+    "07-15147-67281": {"row": 584, "pkg": 3811, "ship": 8063},
+    "01-15163-10197": {"row": 586, "pkg": 3815, "ship": 7500},
+    "05-15156-05008": {"row": 587, "pkg": 3817, "ship": 5527},
+}
+# ★対象3件の近傍にある「絶対に触られてはいけない」行(既存の送料記入済み注文、
+# およびキャンセル注文)。最終確認でこれらの値が不変であることも検証する。
+GUARD_ROWS = [580, 581, 582, 583, 585]
 
 
 def log(msg):
@@ -103,43 +126,6 @@ def _shipping_empty(v):
     return False
 
 
-def select_targets_for_blanking(local_path, n=3):
-    wb = openpyxl.load_workbook(local_path, keep_vba=True, data_only=True)
-    sheet_name = ga.find_sheet_with_orders(wb)
-    ws = wb[sheet_name]
-    ship_col_idx = ga.find_shipping_column(ws, local_path)
-
-    candidates = []
-    for row in range(2, ws.max_row + 1):
-        val = ws.cell(row=row, column=2).value
-        if not val or not isinstance(val, str) or not ORDER_PATTERN.match(val.strip()):
-            continue
-        e_val = ws.cell(row=row, column=5).value
-        if "キャンセル" in str(e_val or ""):
-            continue
-        ship_val = ws.cell(row=row, column=ship_col_idx).value
-        pkg_val = ws.cell(row=row, column=1).value
-        if not _shipping_empty(ship_val) and pkg_val not in (None, ""):
-            candidates.append({"row": row, "order_no": val.strip(),
-                                "orig_pkg": pkg_val, "orig_ship": ship_val})
-    wb.close()
-
-    if len(candidates) < n:
-        raise RuntimeError(f"送料記入済みの候補行が{len(candidates)}件しかありません(必要={n})")
-
-    return candidates[-n:], sheet_name, ship_col_idx
-
-
-def blank_targets(local_path, sheet_name, ship_col_idx, chosen):
-    wb = openpyxl.load_workbook(local_path, keep_vba=True)
-    ws = wb[sheet_name]
-    for c in chosen:
-        ws.cell(row=c["row"], column=1).value = None
-        ws.cell(row=c["row"], column=ship_col_idx).value = None
-    wb.save(local_path)
-    wb.close()
-
-
 def fresh_download(service, test_file_id, test_file_name, tag):
     """毎回あらためてDriveからDLし直す(=新しいプロセス/新しいActions実行を模す)。"""
     workdir = tempfile.mkdtemp(prefix=f"ga_test_{tag}_")
@@ -149,58 +135,89 @@ def fresh_download(service, test_file_id, test_file_name, tag):
     return local_path
 
 
-def run_pass(service, test_file_id, test_file_name, order_limit, tag, prod_ids):
-    """1回分の"起動"を模す: 新規DL → get_target_orders() → 上限件数だけ処理 → 都度チェックポイント保存。"""
-    local_path = fresh_download(service, test_file_id, test_file_name, tag)
-
-    targets_before = sorted(ga.get_target_orders(local_path))
-    log(f"[{tag}] 現在の対象注文(送料空欄): {targets_before}")
-
-    this_pass_targets = targets_before[:order_limit] if order_limit is not None else targets_before
-    log(f"[{tag}] 今回処理する注文: {this_pass_targets}")
-
-    cpass_results = {}
-    checkpoint_log = []
-    for idx, order_no in enumerate(this_pass_targets, start=1):
-        log(f"[{tag}] {idx}/{len(this_pass_targets)}件目 処理開始(ダミー送料、CPaSS未呼び出し): {order_no}")
-        time.sleep(1)
-        fake_price = FAKE_PRICE_BASE + (sum(ord(ch) for ch in order_no) % 9)
-        info = {
-            "package_no": 9000 + idx,
-            "dhl_price_jpy": fake_price,
-            "title": "TEST-DUMMY",
-            "item_id": "TEST-DUMMY",
+def read_guard_and_target_cells(local_path, sheet_name, ship_col_idx, rows):
+    wb = openpyxl.load_workbook(local_path, keep_vba=True, data_only=True)
+    ws = wb[sheet_name]
+    values = {}
+    for row in rows:
+        values[row] = {
+            "order_no": ws.cell(row=row, column=2).value,
+            "pkg_no": ws.cell(row=row, column=1).value,
+            "shipping": ws.cell(row=row, column=ship_col_idx).value,
+            "status_e": ws.cell(row=row, column=5).value,
         }
-        cpass_results[order_no] = info
+    wb.close()
+    return values
 
-        ok, num_writes = ga.process_xlsm(local_path, cpass_results, dry_run=False)
-        entry = {"order_no": order_no, "fake_price": fake_price, "ok": ok, "num_writes": num_writes,
-                  "time": time.strftime("%Y-%m-%d %H:%M:%S")}
-        if ok and num_writes > 0:
-            assert test_file_id not in prod_ids, "重大な設定ミス: テストfile_idが本番file_idと一致"
-            ga._upload_xlsm(service, test_file_id, local_path)
-            entry["uploaded"] = True
-            log(f"[{tag}] [CHECKPOINT] {idx}/{len(this_pass_targets)}件目: {num_writes}セル保存 "
-                f"対象注文={order_no} 送料(ダミー)={fake_price} → Google Driveアップロード成功")
-        else:
-            entry["uploaded"] = False
-            log(f"[{tag}] [CHECKPOINT] {idx}/{len(this_pass_targets)}件目: 書き込みなし(num_writes={num_writes})")
-        checkpoint_log.append(entry)
 
-    targets_after = sorted(ga.get_target_orders(local_path))
-    skipped = sorted(set(targets_before) - set(this_pass_targets))
-    return {
-        "tag": tag,
-        "targets_before": targets_before,
-        "processed": checkpoint_log,
-        "targets_after": targets_after,
-        "not_processed_this_pass": skipped,
-    }
+def reset_and_blank_test_file(service, test_file_id, test_file_name):
+    """既知の元の値へリストア→対象3件を空欄化し、Driveへアップロードしてクリーンな
+    検証開始状態を作る。戻り値は (sheet_name, ship_col_idx, guard_values_before)。
+    """
+    local_path = fresh_download(service, test_file_id, test_file_name, "reset-setup")
+    wb = openpyxl.load_workbook(local_path, keep_vba=True)
+    sheet_name = ga.find_sheet_with_orders(wb)
+    ws = wb[sheet_name]
+    ship_col_idx = ga.find_shipping_column(ws, local_path)
+
+    for order_no, info in KNOWN_ORIGINAL_VALUES.items():
+        row = info["row"]
+        actual_order = ws.cell(row=row, column=2).value
+        assert actual_order and str(actual_order).strip() == order_no, (
+            f"行{row}の注文番号が想定と異なります(想定={order_no}, 実際={actual_order})。"
+            "テストコピーの行構成が変わっている可能性があるため中断します。"
+        )
+        ws.cell(row=row, column=1).value = None
+        ws.cell(row=row, column=ship_col_idx).value = None
+    wb.save(local_path)
+    wb.close()
+
+    log(f"対象3件を既知の元の値へ一旦リストア後、再度空欄化しました: "
+        f"{[(o, i['row']) for o, i in KNOWN_ORIGINAL_VALUES.items()]}")
+
+    guard_values_before = read_guard_and_target_cells(local_path, sheet_name, ship_col_idx, GUARD_ROWS)
+    log(f"ガード行(触られてはいけない既存注文/キャンセル行)の初期値: {guard_values_before}")
+
+    ga._upload_xlsm(service, test_file_id, local_path)
+    log("リストア+空欄化後のテストコピーをGoogle Driveへアップロード完了(検証開始状態を確立)")
+
+    return sheet_name, ship_col_idx, guard_values_before
+
+
+def process_one_order(service, test_file_id, test_file_name, order_no, tag, prod_ids, idx=1, total=1):
+    """指定した1件を処理し、チェックポイント保存する(=新規プロセスでのDL→書込→ULを模す)。"""
+    local_path = fresh_download(service, test_file_id, test_file_name, tag)
+    targets_before = ga.get_target_orders(local_path)
+    log(f"[{tag}] 現在の対象注文(行番号順, 送料空欄): {targets_before}")
+    assert order_no in targets_before, (
+        f"[{tag}] 処理予定の {order_no} が対象注文リストに含まれていません: {targets_before}"
+    )
+
+    fake_price = FAKE_PRICE_BASE + (sum(ord(ch) for ch in order_no) % 9)
+    info = {"package_no": 9000 + idx, "dhl_price_jpy": fake_price,
+            "title": "TEST-DUMMY", "item_id": "TEST-DUMMY"}
+    cpass_results = {order_no: info}
+
+    log(f"[{tag}] {idx}/{total}件目 処理開始(ダミー送料、CPaSS未呼び出し): {order_no}")
+    ok, num_writes = ga.process_xlsm(local_path, cpass_results, dry_run=False)
+    entry = {"order_no": order_no, "fake_price": fake_price, "ok": ok, "num_writes": num_writes,
+              "time": time.strftime("%Y-%m-%d %H:%M:%S"), "targets_before": targets_before}
+    if ok and num_writes > 0:
+        assert test_file_id not in prod_ids, "重大な設定ミス: テストfile_idが本番file_idと一致"
+        ga._upload_xlsm(service, test_file_id, local_path)
+        entry["uploaded"] = True
+        log(f"[{tag}] [CHECKPOINT] {idx}/{total}件目: {num_writes}セル保存 "
+            f"対象注文={order_no} 送料(ダミー)={fake_price} → Google Driveアップロード成功")
+    else:
+        entry["uploaded"] = False
+        log(f"[{tag}] [CHECKPOINT] {idx}/{total}件目: 書き込みなし(num_writes={num_writes})")
+    return entry
 
 
 def main():
     log("=" * 70)
     log(f"開始  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log("get_target_orders()全行スキャン化 + 処理順を行番号順に固定 の修正検証")
     log("=" * 70)
 
     service = ga._get_drive_service()
@@ -213,55 +230,73 @@ def main():
         for f in prod_files_before
     ]
     prod_ids = {f["id"] for f in prod_snapshot_before}
-    log(f"[READ-ONLY] 本番『通常』xlsm一覧(実行前スナップショット, {len(prod_snapshot_before)}件):")
-    for f in prod_snapshot_before:
-        log(f"    {f['name']} (id={f['id']}, modifiedTime={f['modifiedTime']})")
+    log(f"[READ-ONLY] 本番『通常』xlsm一覧(実行前スナップショット, {len(prod_snapshot_before)}件)")
 
     test_folder_id, folder_created = get_or_create_test_subfolder(service, prod_folder_id)
     test_file_id, test_file_name = find_test_copy(service, test_folder_id)
     assert test_file_id not in prod_ids, "重大な設定ミス: テストfile_idが本番file_idと一致しています"
 
-    chosen_summary = []
-    local_path = fresh_download(service, test_file_id, test_file_name, "setup-check")
-    existing_targets = ga.get_target_orders(local_path)
-    if not existing_targets:
-        log("対象注文(送料空欄)が0件 → 未セットアップと判断し、末尾3件を空欄化します")
-        chosen, sheet_name, ship_col_idx = select_targets_for_blanking(local_path, n=3)
-        log(f"送料空欄化対象として選定した{len(chosen)}件(末尾の送料記入済み行):")
-        for c in chosen:
-            log(f"    行{c['row']} 注文={c['order_no']} 元梱包番号={c['orig_pkg']} 元送料={c['orig_ship']}")
-            chosen_summary.append({k: c[k] for k in ("row", "order_no", "orig_pkg", "orig_ship")})
-        blank_targets(local_path, sheet_name, ship_col_idx, chosen)
-        ga._upload_xlsm(service, test_file_id, local_path)
-        log("空欄化後のテストコピーをGoogle Driveへアップロード完了(セットアップ完了)")
-    else:
-        log(f"既にセットアップ済み(対象{len(existing_targets)}件が検出された)のため、空欄化はスキップ: "
-            f"{sorted(existing_targets)}")
+    # ── 0. クリーンな検証開始状態を作る(前回実行の状態を引きずらない) ──
+    sheet_name, ship_col_idx, guard_before = reset_and_blank_test_file(service, test_file_id, test_file_name)
 
-    # ── 1回目の"起動": 1件だけ処理して正常終了 ──
-    result_run1 = run_pass(service, test_file_id, test_file_name, order_limit=1,
-                            tag="RUN1(limit=1)", prod_ids=prod_ids)
+    setup_path = fresh_download(service, test_file_id, test_file_name, "setup-check")
+    initial_targets = ga.get_target_orders(setup_path)
+    log(f"検証開始時点の対象注文(行番号昇順であるはず): {initial_targets}")
+    expected_order = ["07-15147-67281", "01-15163-10197", "05-15156-05008"]
+    assert initial_targets == expected_order, (
+        f"対象注文が行番号昇順で返っていません(期待={expected_order}, 実際={initial_targets})。"
+        "get_target_orders()の修正に問題がある可能性があります。"
+    )
+    log("[OK] get_target_orders()は行番号の昇順でlistを返している(set()の順序不定を解消)")
 
-    # ── 2回目の"起動"(再起動を模す): 新規DLからやり直し、残りを処理 ──
-    result_run2 = run_pass(service, test_file_id, test_file_name, order_limit=None,
-                            tag="RUN2(resume)", prod_ids=prod_ids)
+    # ── 1. わざと「行番号の大きい注文を先に保存」する最悪ケースを作る ──
+    adversarial_order = initial_targets[-1]  # 05-15156-05008 (587行目、最も行番号が大きい)
+    log(f"[意図的な悪条件] 行番号が最も大きい注文を先に処理・保存します: {adversarial_order}")
+    run1_entry = process_one_order(service, test_file_id, test_file_name, adversarial_order,
+                                    tag="RUN1(adversarial: highest-row-first)", prod_ids=prod_ids,
+                                    idx=1, total=1)
 
-    # ── 最終確認: もう一度新規DLして全件埋まっていることを確認 ──
+    # ── 2. 修正の核心確認: 行番号の小さい未処理注文が引き続き検出されるか ──
+    after_run1_path = fresh_download(service, test_file_id, test_file_name, "after-RUN1-check")
+    after_run1_targets = ga.get_target_orders(after_run1_path)
+    log(f"[RUN1後の再スキャン] 対象注文: {after_run1_targets}")
+    expected_after_run1 = ["07-15147-67281", "01-15163-10197"]
+    assert adversarial_order not in after_run1_targets, (
+        f"[NG] 保存済みのはずの{adversarial_order}が再び対象になっています(重複処理防止が壊れています)"
+    )
+    assert after_run1_targets == expected_after_run1, (
+        f"[NG] 行番号の小さい未処理注文が取りこぼされました(期待={expected_after_run1}, "
+        f"実際={after_run1_targets})。get_target_orders()の修正が機能していません。"
+    )
+    log(f"[OK] 行番号の大きい注文({adversarial_order})を先に保存しても、"
+        f"行番号の小さい未処理注文 {expected_after_run1} は取りこぼされずに検出された")
+    log(f"[OK] 保存済みの{adversarial_order}は正しく対象から除外された(重複処理防止も健在)")
+
+    # ── 3. 残り2件を行番号順に処理(=RUN2/再開を模す) ──
+    run2_entries = []
+    for idx, order_no in enumerate(expected_after_run1, start=1):
+        entry = process_one_order(service, test_file_id, test_file_name, order_no,
+                                   tag="RUN2(resume, row-order)", prod_ids=prod_ids,
+                                   idx=idx, total=len(expected_after_run1))
+        run2_entries.append(entry)
+
+    # ── 4. 最終確認: 新規DLしなおして、対象0件・全セルが正しい値か・ガード行が無事か ──
     final_path = fresh_download(service, test_file_id, test_file_name, "FINAL-VERIFY")
-    final_targets = sorted(ga.get_target_orders(final_path))
-    wb = openpyxl.load_workbook(final_path, keep_vba=True, data_only=True)
-    sheet_name = ga.find_sheet_with_orders(wb)
-    ws = wb[sheet_name]
-    ship_col_idx = ga.find_shipping_column(ws, final_path)
+    final_targets = ga.get_target_orders(final_path)
     final_values = {}
-    for c in chosen_summary:
-        row = c["row"]
-        final_values[c["order_no"]] = {
+    for order_no, info in KNOWN_ORIGINAL_VALUES.items():
+        row = info["row"]
+        wb = openpyxl.load_workbook(final_path, keep_vba=True, data_only=True)
+        ws = wb[sheet_name]
+        final_values[order_no] = {
             "row": row,
             "pkg_no_now": ws.cell(row=row, column=1).value,
             "shipping_now": ws.cell(row=row, column=ship_col_idx).value,
         }
-    wb.close()
+        wb.close()
+    guard_after = read_guard_and_target_cells(final_path, sheet_name, ship_col_idx, GUARD_ROWS)
+
+    guard_unchanged = (guard_before == guard_after)
 
     prod_files_after = ga._list_xlsm_files(service, prod_folder_id, "通常")
     prod_snapshot_after = [
@@ -271,13 +306,23 @@ def main():
     prod_unchanged = prod_snapshot_before == prod_snapshot_after
 
     result = {
+        "fix_verified": {
+            "get_target_orders_returns_row_ordered_list": initial_targets == expected_order,
+            "earlier_row_order_not_orphaned_after_later_row_saved_first": after_run1_targets == expected_after_run1,
+            "already_saved_order_excluded_from_rescan": adversarial_order not in after_run1_targets,
+        },
         "test_folder_name": TEST_SUBFOLDER_NAME,
         "test_file_name": test_file_name,
-        "chosen_for_blanking": chosen_summary,
-        "run1": result_run1,
-        "run2_resume": result_run2,
+        "target_3_orders_row_order": initial_targets,
+        "run1_adversarial": run1_entry,
+        "run1_adversarial_order": adversarial_order,
+        "after_run1_targets": after_run1_targets,
+        "run2_resume": run2_entries,
         "final_targets_remaining": final_targets,
         "final_cell_values": final_values,
+        "guard_rows_before": guard_before,
+        "guard_rows_after": guard_after,
+        "guard_rows_unchanged": guard_unchanged,
         "prod_snapshot_before": prod_snapshot_before,
         "prod_snapshot_after": prod_snapshot_after,
         "prod_unchanged": prod_unchanged,
@@ -292,22 +337,37 @@ def main():
     log("=" * 70)
     log(f"テストサブフォルダ: {TEST_SUBFOLDER_NAME}")
     log(f"テストファイル: {test_file_name}")
-    log(f"対象3件: {[c['order_no'] for c in chosen_summary] if chosen_summary else '(前回セットアップ済みを再利用)'}")
-    log(f"RUN1で処理: {[p['order_no'] for p in result_run1['processed']]}")
-    log(f"RUN2で処理(再開分): {[p['order_no'] for p in result_run2['processed']]}")
-    _run1_saved = [p["order_no"] for p in result_run1["processed"] if p.get("uploaded")]
-    log(f"RUN2開始時点で対象から除外(=RUN1保存分が正しくスキップされた): "
-        f"{[o for o in _run1_saved if o not in result_run2['targets_before']]}")
+    log(f"対象3件(行番号昇順): {initial_targets}")
+    log(f"[意図的悪条件] 先に保存した行番号最大の注文: {adversarial_order} "
+        f"(ダミー送料={run1_entry['fake_price']})")
+    log(f"RUN1直後の再スキャンで検出された残り対象: {after_run1_targets} (取りこぼしなし)")
+    log(f"RUN2(再開)で処理: {[e['order_no'] for e in run2_entries]}")
     log(f"最終確認後の対象注文(空欄)残数: {len(final_targets)} 件 {final_targets}")
     log(f"最終セル値: {json.dumps(final_values, ensure_ascii=False, default=str)}")
+    log(f"ガード行(既存送料記入済み・キャンセル行)が無変更か = {guard_unchanged}")
+    if not guard_unchanged:
+        log(f"  [WARN] ガード行に差分があります before={guard_before} after={guard_after}")
     log(f"本番『通常』xlsm一覧: 実行前後で不変か = {prod_unchanged}")
     if not prod_unchanged:
         log("[WARN] 本番ファイル一覧に差分があります。詳細を確認してください。")
         log(f"  before={prod_snapshot_before}")
         log(f"  after={prod_snapshot_after}")
+
+    all_ok = (
+        result["fix_verified"]["get_target_orders_returns_row_ordered_list"]
+        and result["fix_verified"]["earlier_row_order_not_orphaned_after_later_row_saved_first"]
+        and result["fix_verified"]["already_saved_order_excluded_from_rescan"]
+        and len(final_targets) == 0
+        and guard_unchanged
+        and prod_unchanged
+    )
+    log(f"総合判定: {'[PASS] 全項目クリア' if all_ok else '[FAIL] 未クリア項目あり(上記ログ参照)'}")
     log("=" * 70)
     log(f"完了  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log("=" * 70)
+
+    if not all_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

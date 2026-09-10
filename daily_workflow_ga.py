@@ -232,13 +232,23 @@ def find_shipping_column(ws, xlsm_path):
 
 
 def get_target_orders(xlsm_path):
-    """BL/BR空白の新規注文番号セットを返す
+    """送料セル空白の未処理注文番号を「行番号の昇順リスト」で返す
 
-    ★このスキャン方式は変更していない。GitHub Actions版の途中保存(チェックポイント)機構は、
-    このxlsmファイル自体をこまめに保存することで成立している。つまり:
+    ★2026/09/10チェックポイント機構導入時の想定:
       - 実行中にチェックポイント保存された注文 → 次回この関数を呼んだ時点で
         既に送料セルが埋まっている → targetsから自動的に除外される（＝再開・重複防止）。
-    追加の状態ファイル(「何件目まで処理済み」等)を持たない設計。
+      追加の状態ファイル(「何件目まで処理済み」等)を持たない設計。
+
+    ★2026/09/10 追加修正（チェックポイント隔離テストで発見した不具合の対応）:
+      旧実装は「送料記入済み最終行(last_filled_row)より後ろの行だけ」を対象注文の
+      スキャン範囲にしていた。ところが1回の実行で複数件を処理する場合、行番号が
+      後ろの注文が先にチェックポイント保存されると last_filled_row がその行まで
+      一気に進んでしまい、まだ未処理のまま残っている「それより前の行」の注文が
+      次回のスキャンで検出されなくなる（＝送料が空欄のまま、エラーも出さずに
+      永久に取りこぼされる）不具合があった。
+      → last_filled_row はログ表示用の診断情報としてのみ残し、対象注文の判定
+      自体はシート全体（行2〜最終行）を対象にするよう変更。返り値もset()ではなく
+      行番号順のlistとし、CPaSSへ渡す処理順が不定にならないようにした。
     """
     order_pattern = re.compile(r"^\d{2}-\d{5}-\d{5}$")
 
@@ -246,7 +256,7 @@ def get_target_orders(xlsm_path):
     sheet_name = find_sheet_with_orders(wb)
     if not sheet_name:
         wb.close()
-        return set()
+        return []
     ws = wb[sheet_name]
     ship_col_idx = find_shipping_column(ws, xlsm_path)
     shipping_col = openpyxl.utils.get_column_letter(ship_col_idx)
@@ -266,16 +276,29 @@ def get_target_orders(xlsm_path):
 
     order_rows = []
     last_filled_row = 1
+    targets = []
+    seen_orders = set()
     for row in range(2, ws.max_row + 1):
         val = ws.cell(row=row, column=2).value
         if not val or not isinstance(val, str) or not order_pattern.match(val.strip()):
             continue
+        order_no = val.strip()
         order_rows.append(row)
         br_val = ws.cell(row=row, column=ship_col_idx).value
-        if not _shipping_empty(br_val):
+        shipping_empty = _shipping_empty(br_val)
+        if not shipping_empty:
             last_filled_row = row
 
-    print(f"  送料記入済み最終行: {last_filled_row}")
+        # ★対象判定はシート全体で行う（last_filled_rowによる範囲制限はしない。上記docstring参照）。
+        #   「送料記入不要」条件（キャンセル等）は従来どおり維持する。
+        e_val = ws.cell(row=row, column=5).value
+        if "キャンセル" in str(e_val or ""):
+            continue
+        if shipping_empty and order_no not in seen_orders:
+            targets.append(order_no)
+            seen_orders.add(order_no)
+
+    print(f"  送料記入済み最終行: {last_filled_row}（診断用ログのみ。対象注文の判定には使用しない）")
 
     # ★診断ログ: 末尾15注文行の送料セル生値（誤認バグ調査用）
     for row in order_rows[-15:]:
@@ -283,18 +306,6 @@ def get_target_orders(xlsm_path):
         _o = str(ws.cell(row=row, column=2).value).strip()
         _e = str(ws.cell(row=row, column=5).value or "")[:8]
         print(f"    [DEBUG] 行{row} {_o} {shipping_col}={_v!r} E={_e}")
-
-    targets = set()
-    for row in range(last_filled_row + 1, ws.max_row + 1):
-        val = ws.cell(row=row, column=2).value
-        if not val or not isinstance(val, str) or not order_pattern.match(val.strip()):
-            continue
-        e_val = ws.cell(row=row, column=5).value
-        if "キャンセル" in str(e_val or ""):
-            continue
-        br_val = ws.cell(row=row, column=ship_col_idx).value
-        if _shipping_empty(br_val):
-            targets.add(val.strip())
 
     wb.close()
     return targets
@@ -487,12 +498,20 @@ def main():
             return
 
         # Step 2: 対象注文番号収集
-        target_order_nos = set()
+        # ★2026/09/10修正: target_order_nosはset()ではなく行番号順のlistとして組み立てる。
+        # set()だと反復順序がPythonのハッシュ値依存で不定になり、CPaSSへ渡す処理順も
+        # 不定になってしまう（チェックポイント隔離テストで、行順序と異なる順で保存された
+        # 場合に未処理注文が取りこぼされる不具合につながることが判明したため）。
+        target_order_nos = []
+        _seen_order_nos = set()
         xlsm_paths = {}
         for prefix, (local_path, file_id) in dl_result.items():
             try:
                 targets = get_target_orders(local_path)
-                target_order_nos |= targets
+                for _order_no in targets:
+                    if _order_no not in _seen_order_nos:
+                        target_order_nos.append(_order_no)
+                        _seen_order_nos.add(_order_no)
                 xlsm_paths[prefix] = (local_path, file_id)
                 print(f"  {prefix}: 対象{len(targets)}件")
                 summary_lines.append(f"{prefix}: 対象注文{len(targets)}件")
@@ -511,9 +530,9 @@ def main():
         if _verify_orders_env:
             _verify_set = set(x.strip() for x in _verify_orders_env.split(",") if x.strip())
             _before = len(target_order_nos)
-            target_order_nos = target_order_nos & _verify_set
+            target_order_nos = [o for o in target_order_nos if o in _verify_set]
             print(f"  [検証モード] VERIFY_ORDER_NOS指定あり → 対象を{_before}件から"
-                  f"{len(target_order_nos)}件に制限: {sorted(target_order_nos)}")
+                  f"{len(target_order_nos)}件に制限: {target_order_nos}")
 
         # ─── 途中保存(チェックポイント)まわりの状態 ───
         # ★2026/09/10追加: cpass_results はCPaSS処理の進行に応じて逐次このdictへ反映され、
