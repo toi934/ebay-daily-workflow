@@ -502,16 +502,13 @@ def main():
         # set()だと反復順序がPythonのハッシュ値依存で不定になり、CPaSSへ渡す処理順も
         # 不定になってしまう（チェックポイント隔離テストで、行順序と異なる順で保存された
         # 場合に未処理注文が取りこぼされる不具合につながることが判明したため）。
-        target_order_nos = []
         _seen_order_nos = set()
         xlsm_paths = {}
+        per_prefix_targets = {}
         for prefix, (local_path, file_id) in dl_result.items():
             try:
                 targets = get_target_orders(local_path)
-                for _order_no in targets:
-                    if _order_no not in _seen_order_nos:
-                        target_order_nos.append(_order_no)
-                        _seen_order_nos.add(_order_no)
+                per_prefix_targets[prefix] = targets
                 xlsm_paths[prefix] = (local_path, file_id)
                 print(f"  {prefix}: 対象{len(targets)}件")
                 summary_lines.append(f"{prefix}: 対象注文{len(targets)}件")
@@ -519,6 +516,20 @@ def main():
                 msg = f"{prefix}の注文抽出失敗: {e}"
                 print(msg)
                 errors.append(msg)
+
+        # ラウンドロビン方式: 通常・専門から1件ずつ交互に対象へ追加し、
+        # 片方が尽きたら残りをもう片方から処理する
+        # （一方のアカウントが常に後回しになるのを防ぐ2026/09/13修正）
+        target_order_nos = []
+        _rr_queues = {p: list(t) for p, t in per_prefix_targets.items()}
+        _rr_prefix_order = list(per_prefix_targets.keys())
+        while any(_rr_queues[p] for p in _rr_prefix_order):
+            for p in _rr_prefix_order:
+                if _rr_queues[p]:
+                    _order_no = _rr_queues[p].pop(0)
+                    if _order_no not in _seen_order_nos:
+                        target_order_nos.append(_order_no)
+                        _seen_order_nos.add(_order_no)
 
         print(f"\n送料列が空白の対象注文: {len(target_order_nos)} 件")
 
