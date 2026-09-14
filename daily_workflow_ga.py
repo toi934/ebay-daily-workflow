@@ -31,7 +31,7 @@ import io
 import smtplib
 import tempfile
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -64,6 +64,9 @@ EXCHANGE_RATE_KEYWORDS = ["為替", "為"]
 SHIPPING_HEADER_KEYWORDS = ["国際送料"]
 DRIVE_FOLDER_NAME = "売上管理表"
 GMAIL_FROM = "gen7m9@gmail.com"
+# ★2026/09/14追加: 結果メールの時刻表示をJST固定にするため。
+# GitHub Actionsランナーの実行TZ(UTC)に依存しないよう明示的に+9時間する。
+JST = timezone(timedelta(hours=9))
 
 # ★2026/09/10追加: 途中保存(チェックポイント)関連のデフォルト設定。
 # どちらも環境変数で上書き可能（テスト時などに調整しやすいように）。
@@ -415,13 +418,29 @@ def process_xlsm(xlsm_path, cpass_results, dry_run=False):
 
 
 # ─── メール送信 ───
-def send_result_email(results_text, run_count, error_text=""):
+def send_result_email(results_text, run_count, error_text="", start_time_jst=None):
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "")
     if not app_password:
         print("  GMAIL_APP_PASSWORD未設定、メールスキップ")
         return
     subject = f"タスク2（売上管理表）実行結果 ({run_count}回目)"
-    body = f"実行日時: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}\n\n"
+    # ★2026/09/14修正: 「実行日時」がワークフローの開始時刻ではなく、この関数の
+    # 呼び出し直前（＝処理完了直後）のdatetime.now()になっており、実質的に
+    # 完了時刻を「実行日時」と誤表示していた（2026/09/14の調査で判明）。
+    # 開始日時（main()冒頭のstart_time_jst）と完了日時（この関数の呼び出し時点）を
+    # 分けて表示するよう修正。GitHub Actionsランナーの実行TZ(UTC)に依存しないよう、
+    # 明示的にUTC取得→JST(UTC+9)へ変換してから表示する。
+    end_time_jst = datetime.now(timezone.utc).astimezone(JST)
+    if start_time_jst is not None:
+        elapsed = int((end_time_jst - start_time_jst).total_seconds())
+        body = (
+            f"開始日時: {start_time_jst.strftime('%Y/%m/%d %H:%M:%S')} JST\n"
+            f"完了日時: {end_time_jst.strftime('%Y/%m/%d %H:%M:%S')} JST\n"
+            f"経過時間: {elapsed}秒\n\n"
+        )
+    else:
+        # start_time_jst未指定時（想定外呼び出し向けフォールバック）
+        body = f"完了日時: {end_time_jst.strftime('%Y/%m/%d %H:%M:%S')} JST\n\n"
     body += results_text
     if error_text:
         body += f"\n\n【エラー】\n{error_text}"
@@ -454,6 +473,7 @@ def _get_run_count():
 def main():
     dry_run = "--dry-run" in sys.argv
     start_time = datetime.now()
+    start_time_jst = datetime.now(timezone.utc).astimezone(JST)
     start_ts = time.time()
 
     print("=" * 60)
@@ -489,12 +509,12 @@ def main():
             msg = f"Google Drive DL失敗: {e}"
             print(msg)
             errors.append(msg)
-            send_result_email("Google Drive DL失敗", run_count, "\n".join(errors))
+            send_result_email("Google Drive DL失敗", run_count, "\n".join(errors), start_time_jst=start_time_jst)
             return
 
         if not dl_result:
             print("対象ファイルなし、終了")
-            send_result_email("対象ファイルなし", run_count)
+            send_result_email("対象ファイルなし", run_count, start_time_jst=start_time_jst)
             return
 
         # Step 2: 対象注文番号収集
@@ -646,10 +666,9 @@ def main():
     print(f"完了  {end_time.strftime('%Y-%m-%d %H:%M:%S')}  ({elapsed}秒)")
     print("=" * 60)
 
-    # メール送信
+    # メール送信（開始日時・完了日時・経過時間はsend_result_email側でJST表示する）
     results_text = "\n".join(summary_lines) if summary_lines else "処理完了（書き込みなし）"
-    results_text += f"\n\n経過時間: {elapsed}秒"
-    send_result_email(results_text, run_count, "\n".join(errors))
+    send_result_email(results_text, run_count, "\n".join(errors), start_time_jst=start_time_jst)
 
 
 if __name__ == "__main__":
