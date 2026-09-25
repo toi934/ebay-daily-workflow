@@ -86,6 +86,7 @@ jobs:
             cpass_action_ss.png
             cpass_after_assign_ss.png
             cpass_processing_dump.html
+            cpass_waiting_dump.html
             cpass_dhl_results.json
           if-no-files-found: ignore
           retention-days: 7
@@ -97,5 +98,22 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           TZ=Asia/Tokyo date +%F > last_run_date.txt
           git add run_count_task2.txt last_run_date.txt || true
+          # ★2026/09/25追加: 前回未処理だった対象注文リスト（翌日の「新規対象」判定の基準）
+          git add task2_unmatched_orders.txt 2>/dev/null || true
           git diff --staged --quiet || git commit -m "Update run count task2"
           git push || true
+
+      # ★2026/09/25追加: 「処理0件なのにsuccess」の再発防止。
+      #   daily_workflow_ga.py が異常と判定した日（Excelに新規の未処理対象があるのにCPaSS処理0件、
+      #   一括移動失敗、送料取得後の書込み0件、書込み後のDrive未更新 等）だけ task2_anomaly.txt を作る。
+      #   ここで失敗扱いにする（Commit run count の後なので last_run_date は更新済み
+      #   → 保険の15分cronが同日に何度も再実行することはない）。
+      - name: Fail if run health check detected an anomaly
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          if [ -f task2_anomaly.txt ]; then
+            echo "::error title=タスク2 異常（正常完了ではありません）::$(tr '\n' ' ' < task2_anomaly.txt)"
+            cat task2_anomaly.txt
+            exit 1
+          fi
+          echo "健全性チェック: 異常なし"
