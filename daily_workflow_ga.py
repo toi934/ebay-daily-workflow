@@ -417,13 +417,121 @@ def process_xlsm(xlsm_path, cpass_results, dry_run=False):
     return True, len(writes)
 
 
+# ─── ★2026/09/25追加: 実行結果の健全性チェック（「処理0件なのにsuccess」の再発防止） ───
+UNMATCHED_STATE_FILE = "task2_unmatched_orders.txt"   # 前回実行時点で未処理のまま残った対象注文
+ANOMALY_MARKER_FILE = "task2_anomaly.txt"             # 異常時のみ作成 → workflow最終ステップでfailure化
+
+
+def load_prev_unmatched(path=UNMATCHED_STATE_FILE):
+    """前回実行時に未処理で残った注文番号の集合。ファイルが無ければNone（比較不能）。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return set(l.strip() for l in f if re.match(r"^\d{2}-\d{5}-\d{5}$", l.strip()))
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"  [WARN] {path} 読み込み失敗: {e}")
+        return None
+
+
+def save_unmatched(orders, path=UNMATCHED_STATE_FILE):
+    with open(path, "w", encoding="utf-8") as f:
+        for o in sorted(set(orders)):
+            f.write(o + "\n")
+
+
+def evaluate_run_health(target_order_nos, diag, cpass_error, dhl_ok_orders,
+                        total_writes, drive_uploads, prev_unmatched):
+    """今回の実行が「正常完了」と言えるかを判定する（純粋関数・テスト対象）。
+
+    返り値: dict(level, reasons, notes, new_targets, new_missing)
+      level: "ok"      … 正常完了（対象を処理した／本当に新規対象が無い日）
+             "warning" … 一部未処理など注意（failureにはしない）
+             "anomaly" … 異常。Excelに新規の未処理対象があるのにCPaSS処理0件 等
+    方針（戸井さん指示 2026/09/25）:
+      - Excel上に未処理対象があるのにCPaSS取得・処理が0件 → 正常終了と判定しない
+      - 本当に新規対象注文が0件の日は正常終了のまま
+        （毎日CPaSS発送手続きタブに存在しない古い送料空欄注文が約90件あるため、
+         「前回実行時にも未処理だった注文」は新規扱いしない）
+    """
+    diag = diag or {}
+    targets = list(target_order_nos or [])
+    missing = set(diag.get("missing_order_nos") or [])
+    matched = list(diag.get("matched_order_nos") or [])
+    move_status = diag.get("move_status")
+    reasons, notes = [], []
+
+    if prev_unmatched is None:
+        new_targets = list(targets)  # 比較基準が無い初回は全件を新規として扱う
+        notes.append("前回の未処理リストが無いため、全対象を新規として判定")
+    else:
+        new_targets = [o for o in targets if o not in prev_unmatched]
+    new_missing = [o for o in new_targets if o in missing]
+    processed = len(dhl_ok_orders)
+
+    if cpass_error:
+        reasons.append(f"CPaSS処理が例外で中断: {cpass_error}")
+    if move_status == "failed":
+        reasons.append("発送手続き待ち→発送手続きの一括移動に失敗: " + str(diag.get("move_detail", "")))
+    if diag.get("stuck_in_waiting_order_nos"):
+        reasons.append("発送手続き待ちの対象注文が発送手続きへ移っていない: "
+                       + ", ".join(diag["stuck_in_waiting_order_nos"]))
+    if matched and processed == 0 and not diag.get("safe_stopped"):
+        reasons.append(f"CPaSS発送手続きタブで対象{len(matched)}件を見つけたが送料取得0件")
+    if processed > 0 and total_writes == 0:
+        reasons.append(f"送料取得{processed}件なのにExcel書き込み0件")
+    if total_writes > 0 and drive_uploads == 0:
+        reasons.append(f"Excel書き込み{total_writes}セルなのにGoogle Drive更新0件")
+    if processed == 0 and new_missing:
+        reasons.append(
+            f"Excelに新規の未処理対象{len(new_missing)}件があるのにCPaSS処理0件"
+            f"（発送手続きタブに無い: {', '.join(new_missing[:10])}"
+            f"{' …' if len(new_missing) > 10 else ''}）")
+    elif new_missing:
+        notes.append(f"新規対象のうちCPaSS発送手続きタブに無いもの{len(new_missing)}件: "
+                     + ", ".join(new_missing[:10]))
+
+    if reasons:
+        level = "anomaly"
+    elif new_missing or diag.get("safe_stopped"):
+        level = "warning"
+    else:
+        level = "ok"
+    return {"level": level, "reasons": reasons, "notes": notes,
+            "new_targets": new_targets, "new_missing": new_missing}
+
+
+def build_health_header(health, processed, total_writes, drive_uploads, n_targets):
+    """結果メール冒頭の判定ブロック（正常完了と誤認できない表示）。"""
+    lvl = health["level"]
+    if lvl == "anomaly":
+        head = "■判定: ★異常（正常完了ではありません）★"
+    elif lvl == "warning":
+        head = "■判定: 注意（一部未処理あり）"
+    elif n_targets and not health["new_targets"] and processed == 0:
+        head = "■判定: 正常完了（新規の対象注文なし）"
+    else:
+        head = "■判定: 正常完了"
+    lines = [head,
+             f"処理対象(CPaSSで送料取得): {processed}件",
+             f"送料書込み: {total_writes}セル",
+             f"Drive更新: {drive_uploads}回" if drive_uploads else "Drive更新: なし",
+             f"新規の対象注文: {len(health['new_targets'])}件"]
+    for r in health["reasons"]:
+        lines.append("  ×" + r)
+    for n in health["notes"]:
+        lines.append("  ・" + n)
+    return "\n".join(lines) + "\n\n"
+
+
 # ─── メール送信 ───
-def send_result_email(results_text, run_count, error_text="", start_time_jst=None):
+def send_result_email(results_text, run_count, error_text="", start_time_jst=None,
+                      subject_prefix="", header_text=""):
     app_password = os.environ.get("GMAIL_APP_PASSWORD", "")
+    subject = f"{subject_prefix}タスク2（売上管理表）実行結果 ({run_count}回目)"
     if not app_password:
-        print("  GMAIL_APP_PASSWORD未設定、メールスキップ")
+        print(f"  GMAIL_APP_PASSWORD未設定、メールスキップ（件名予定: {subject}）")
         return
-    subject = f"タスク2（売上管理表）実行結果 ({run_count}回目)"
     # ★2026/09/14修正: 「実行日時」がワークフローの開始時刻ではなく、この関数の
     # 呼び出し直前（＝処理完了直後）のdatetime.now()になっており、実質的に
     # 完了時刻を「実行日時」と誤表示していた（2026/09/14の調査で判明）。
@@ -441,6 +549,7 @@ def send_result_email(results_text, run_count, error_text="", start_time_jst=Non
     else:
         # start_time_jst未指定時（想定外呼び出し向けフォールバック）
         body = f"完了日時: {end_time_jst.strftime('%Y/%m/%d %H:%M:%S')} JST\n\n"
+    body += header_text
     body += results_text
     if error_text:
         body += f"\n\n【エラー】\n{error_text}"
@@ -569,7 +678,10 @@ def main():
         # ★2026/09/10追加: cpass_results はCPaSS処理の進行に応じて逐次このdictへ反映され、
         # process_xlsm() へ渡すたびに「その時点までに取得できた送料」でExcelへ書き込む。
         cpass_results = {}
-        checkpoint_state = {"since_last_save": 0, "saved_total": 0, "pending_orders": [], "last_error": None}
+        checkpoint_state = {"since_last_save": 0, "saved_total": 0, "pending_orders": [], "last_error": None,
+                            "total_writes": 0, "drive_uploads": 0}
+        cpass_diag = {}
+        cpass_error = None
 
         def _do_checkpoint(reason):
             """現時点のcpass_resultsで対象xlsmへ書き込み→Google Driveへ途中保存する。"""
@@ -579,7 +691,9 @@ def main():
                 try:
                     ok, num_writes = process_xlsm(_local_path, cpass_results, dry_run=dry_run)
                     if ok and num_writes > 0 and not dry_run:
+                        checkpoint_state["total_writes"] += num_writes
                         _upload_xlsm(service, _file_id, _local_path)
+                        checkpoint_state["drive_uploads"] += 1
                         any_saved = True
                         print(f"  [CHECKPOINT] {_prefix}: {num_writes}セル保存 "
                               f"対象注文={pending} → Google Driveアップロード成功 ({reason})")
@@ -620,6 +734,7 @@ def main():
                     move_waiting=True,
                     on_order_done=_on_order_done,
                     deadline_ts=deadline_ts,
+                    diagnostics=cpass_diag,
                 )
                 if _cpass_final:
                     # cpass_workflow側の最終dictで念のため同期（_on_order_doneで既に
@@ -634,6 +749,7 @@ def main():
                 msg = f"CPaSS処理エラー: {e}"
                 print(msg)
                 errors.append(msg)
+                cpass_error = str(e)[:200]
 
         # Step 4: 最終フラッシュ
         # CHECKPOINT_EVERY_N=1（既定）なら基本的にここで新規書き込みは発生しないはずだが、
@@ -644,10 +760,14 @@ def main():
             try:
                 ok, num_writes = process_xlsm(local_path, cpass_results, dry_run=dry_run)
                 if ok and num_writes > 0 and not dry_run:
+                    checkpoint_state["total_writes"] += num_writes
                     _upload_xlsm(service, file_id, local_path)
+                    checkpoint_state["drive_uploads"] += 1
                     summary_lines.append(f"{prefix}: 最終フラッシュ {num_writes}セル 保存・UL完了")
                 elif ok:
-                    summary_lines.append(f"{prefix}: 保存・UL完了（途中保存済み、追加分なし）")
+                    # ★2026/09/25修正: 書き込み0件の日も「保存・UL完了」と出ていて
+                    #   正常完了と誤認させていたため、実際の更新有無で表示を分ける。
+                    summary_lines.append(f"{prefix}: 最終フラッシュで追加書き込みなし")
             except Exception as e:
                 msg = f"{prefix}の処理失敗: {e}"
                 print(msg)
@@ -657,6 +777,35 @@ def main():
             f"途中保存(チェックポイント): 累計{checkpoint_state['saved_total']}件処理 "
             f"/ 安全停止デッドライン{SAFETY_BUDGET_SECONDS}秒"
         )
+
+        # ─── ★2026/09/25追加: 実行結果の健全性チェック ───
+        health = None
+        if not dry_run:
+            dhl_ok_orders = [o for o, v in cpass_results.items() if v.get("dhl_price_jpy")]
+            prev_unmatched = load_prev_unmatched()
+            health = evaluate_run_health(
+                target_order_nos, cpass_diag, cpass_error, dhl_ok_orders,
+                checkpoint_state["total_writes"], checkpoint_state["drive_uploads"], prev_unmatched)
+            print(f"  [健全性チェック] 判定={health['level']} 新規対象={len(health['new_targets'])}件 "
+                  f"CPaSS送料取得={len(dhl_ok_orders)}件 書込={checkpoint_state['total_writes']}セル "
+                  f"Drive更新={checkpoint_state['drive_uploads']}回 移動={cpass_diag.get('move_status')}")
+            for r in health["reasons"]:
+                print("    [異常] " + r)
+            for n in health["notes"]:
+                print("    [注意] " + n)
+            if _verify_orders_env:
+                print("  [健全性チェック] 検証モードのため未処理リスト・異常マーカーは更新しない")
+            else:
+                if health["level"] != "anomaly":
+                    # 正常/注意の日だけ基準を更新（異常の日は据え置き、翌日も同じ注文を検知し続ける）
+                    save_unmatched([o for o in target_order_nos if o not in set(dhl_ok_orders)])
+                if health["level"] == "anomaly":
+                    with open(ANOMALY_MARKER_FILE, "w", encoding="utf-8") as f:
+                        f.write("\n".join(health["reasons"]) + "\n")
+            health_header = build_health_header(
+                health, len(dhl_ok_orders), checkpoint_state["total_writes"],
+                checkpoint_state["drive_uploads"], len(target_order_nos))
+            print(health_header.rstrip())
 
     end_time = datetime.now()
     elapsed = int((end_time - start_time).total_seconds())
@@ -668,7 +817,16 @@ def main():
 
     # メール送信（開始日時・完了日時・経過時間はsend_result_email側でJST表示する）
     results_text = "\n".join(summary_lines) if summary_lines else "処理完了（書き込みなし）"
-    send_result_email(results_text, run_count, "\n".join(errors), start_time_jst=start_time_jst)
+    _prefix = ""
+    _header = ""
+    if health is not None:
+        _header = health_header
+        if health["level"] == "anomaly":
+            _prefix = "【要確認・未処理】"
+        elif health["level"] == "warning":
+            _prefix = "【注意】"
+    send_result_email(results_text, run_count, "\n".join(errors), start_time_jst=start_time_jst,
+                      subject_prefix=_prefix, header_text=_header)
 
 
 if __name__ == "__main__":

@@ -484,8 +484,68 @@ def _navigate_to_sidebar_tab(page, tab_label):
     print("    現在URL: " + page.url)
 
 
+# ★2026/09/25: 「発送手続き待ち→発送手続き」一括移動の結果区分
+MOVE_STATUS_MOVED = "moved"    # 発送手続き待ちに注文があり、確認ダイアログまで完了した
+MOVE_STATUS_EMPTY = "empty"    # 発送手続き待ちが0件（「すべて」チェックボックスがdisabled かつ 注文番号なし）
+MOVE_STATUS_FAILED = "failed"  # 注文があるのに移動できなかった／画面構成が想定と違い判定できなかった
+
+def _read_waiting_tab_state(page):
+    """発送手続き待ちタブの状態を読み取る（読み取りのみ・クリックしない）。
+
+    ★2026/09/25追加。2026/09/08の実機診断(diag_move_dialog.py)で、注文0件のときは
+    テーブルが "No data" になり「すべて」チェックボックス（.search_allcheck内のinput）が
+    disabledになることを確認済み。サイドバーのバッジ件数はテーブル実件数と一致しない
+    ことがあるため判定には使わない。
+    Returns: dict(checkbox_found, checkbox_disabled, no_data, order_nos, bulk_button_found)
+    """
+    try:
+        return page.evaluate(
+            """() => {
+                const cb = document.querySelector('.search_allcheck input[type="checkbox"]');
+                const body = document.querySelector('.ant-table-tbody')
+                    || document.querySelector('.ant-table')
+                    || document.querySelector('main')
+                    || document.body;
+                const text = body ? (body.innerText || '') : '';
+                const noData = !!document.querySelector('.ant-empty, .ant-table-placeholder')
+                    || /No data|データがありません/.test(text);
+                const btn = document.querySelector('button[data-tour="ready_to_ship"]');
+                const ids = Array.from(new Set(text.match(/\\b\\d{2}-\\d{5}-\\d{5}\\b/g) || []));
+                return {
+                    checkbox_found: !!cb,
+                    checkbox_disabled: cb ? !!cb.disabled : null,
+                    no_data: noData,
+                    order_nos: ids,
+                    bulk_button_found: !!btn,
+                };
+            }"""
+        )
+    except Exception as e:
+        print("    [WARN] 発送手続き待ちタブの状態読み取りに失敗: " + str(e)[:80])
+        return {"checkbox_found": False, "checkbox_disabled": None, "no_data": False,
+                "order_nos": [], "bulk_button_found": False}
+
+
 def _move_all_to_processing(page):
-    """発送手続き待ち の全件を 発送手続き へ移動"""
+    """発送手続き待ち の全件を 発送手続き へ移動
+
+    ★2026/09/25全面修正（タスク2 GitHub Actions版）。
+      2026/09/25の本番実行で、「すべて」チェックボックスをどのセレクタでもcheckできず、
+      JSフォールバックは戻り値を見ずに「[OK]」と表示、続く一括ボタンも押せずに
+      'a:has-text("発送手続き")'（＝サイドバーの「発送手続き」タブへのリンク）を
+      クリックしてしまい、何も移動しないまま「確認ダイアログを閉じられませんでした」
+      で先へ進んでいた。この誤クリック経路は2026/09/08にローカル(Windows)版の
+      cpass_workflow.pyでだけ修正済みで、GitHub Actions版には入っていなかった。
+      本修正で:
+        1) 移動前に発送手続き待ちタブの状態（0件/注文あり/判定不能）を読み取ってログに出す
+        2) 0件なら何もクリックせず MOVE_STATUS_EMPTY を返す
+        3) サイドバーのリンクに当たりうる a:has-text セレクタを削除し、
+           一括ボタンは data-tour="ready_to_ship" で一意に指定
+        4) JSフォールバックは戻り値がtrueのときだけ成功扱い
+        5) 失敗時は MOVE_STATUS_FAILED を返し、呼び出し側で「異常」として扱えるようにする
+
+    Returns: dict(status, detail, waiting_order_nos)
+    """
     print("発送手続き待ち → 発送手続き へ移動...")
     # まず発送手続き待ちタブへ
     _navigate_to_sidebar_tab(page, "発送手続き待ち")
@@ -494,14 +554,51 @@ def _move_all_to_processing(page):
         page.wait_for_load_state("networkidle", timeout=10000)
     except Exception:
         pass
+    try:
+        _dismiss_announcement_modal(page)
+    except Exception:
+        pass
+
+    # ★2026/09/25追加: 移動前の発送手続き待ちタブのHTMLを保存（障害時の根本原因確認用・Artifactsへ保存）
+    try:
+        _wdump = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpass_waiting_dump.html")
+        with open(_wdump, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        print("  HTML保存: " + _wdump)
+    except Exception:
+        pass
+
+    state = _read_waiting_tab_state(page)
+    waiting = list(state.get("order_nos") or [])
+    print("  [状態] 発送手続き待ち: 「すべて」チェックボックス="
+          + ("なし" if not state.get("checkbox_found") else
+             ("disabled" if state.get("checkbox_disabled") else "有効"))
+          + " / No data表示=" + str(bool(state.get("no_data")))
+          + " / 画面上の注文番号=" + str(len(waiting)) + "件"
+          + (" (" + ", ".join(waiting[:20]) + (" …" if len(waiting) > 20 else "") + ")" if waiting else "")
+          + " / 一括ボタン(data-tour)=" + ("あり" if state.get("bulk_button_found") else "なし"))
+
+    def _result(status, detail):
+        print("  [移動結果] " + status + ": " + detail)
+        return {"status": status, "detail": detail, "waiting_order_nos": waiting}
+
+    if not state.get("checkbox_found"):
+        return _result(MOVE_STATUS_FAILED,
+                       "「すべて」チェックボックス(.search_allcheck)が見つからない（CPaSS画面変更の可能性）")
+
+    if state.get("checkbox_disabled"):
+        if waiting:
+            return _result(MOVE_STATUS_FAILED,
+                           "チェックボックスがdisabledなのに注文番号が表示されている（判定不能）")
+        return _result(MOVE_STATUS_EMPTY, "発送手続き待ちは0件（移動対象なし）")
 
     # 「すべて」のチェックボックスをクリック
     print("  全選択チェックボックスをクリック...")
     selected = False
     for sel in [
+        '.search_allcheck input[type="checkbox"]',
         'input[type="checkbox"]:near(:text("すべて"))',
         'label:has-text("すべて") input[type="checkbox"]',
-        'span:has-text("すべて") >> xpath=.. >> input[type="checkbox"]',
     ]:
         try:
             page.locator(sel).first.check(timeout=2000)
@@ -511,45 +608,41 @@ def _move_all_to_processing(page):
         except Exception:
             pass
     if not selected:
-        # 「すべて」というテキスト要素を見つけてその近くのチェックボックスをクリック
         try:
-            page.evaluate(
+            js_ok = page.evaluate(
                 """() => {
-                    const labels = Array.from(document.querySelectorAll('*'))
-                        .filter(el => (el.textContent || '').trim().startsWith('すべて'));
-                    for (const lbl of labels) {
-                        let elem = lbl;
-                        for (let i = 0; i < 5; i++) {
-                            elem = elem.parentElement;
-                            if (!elem) break;
-                            const cb = elem.querySelector('input[type="checkbox"]');
-                            if (cb) { cb.click(); return true; }
-                        }
-                    }
-                    return false;
+                    const cb = document.querySelector('.search_allcheck input[type="checkbox"]');
+                    if (!cb || cb.disabled) return false;
+                    if (!cb.checked) cb.click();
+                    return !!cb.checked;
                 }"""
             )
-            selected = True
-            print("    [OK] JS-based すべてチェックボックス")
         except Exception as e:
+            js_ok = False
             print("    [失敗] " + str(e)[:80])
+        if js_ok:
+            selected = True
+            print("    [OK] JS-based すべてチェックボックス（checked=trueを確認）")
 
     if not selected:
-        print("  警告: 全選択チェックボックスが見つかりません。手動で実行してください")
-        return False
+        return _result(MOVE_STATUS_FAILED, "「すべて」チェックボックスを選択できなかった")
 
     time.sleep(1)
 
     # 「発送手続き」ボタンをクリック（一括処理）
+    # ★サイドバーの「発送手続き」タブ(<a>)に誤マッチする 'a:has-text("発送手続き")' は使わない。
     print("  「発送手続き」一括ボタンをクリック...")
     clicked = False
     for sel in [
+        'button[data-tour="ready_to_ship"]',
+        '.pull-left.btn-group button:has-text("発送手続き")',
         'button:has-text("発送手続き")',
-        'a:has-text("発送手続き")',
-        '[role="button"]:has-text("発送手続き")',
     ]:
         try:
-            page.locator(sel).first.click(timeout=3000)
+            loc = page.locator(sel).first
+            if not loc.is_enabled(timeout=2000):
+                continue
+            loc.click(timeout=3000)
             clicked = True
             print("    [OK] " + sel)
             break
@@ -557,26 +650,20 @@ def _move_all_to_processing(page):
             pass
 
     if not clicked:
-        print("  警告: 「発送手続き」ボタンが見つかりません")
-        return False
+        return _result(MOVE_STATUS_FAILED, "「発送手続き」一括ボタンをクリックできなかった")
 
     time.sleep(2)
 
     # 確認ダイアログが出た場合「確認」ボタンをクリック（最大12秒待機）
     # ★2026/07/14修正（重大バグ）: 実際のダイアログはAntD(.ant-modal)ではなく新UI
     #   (.sp-modal-dialog > .prompt-modal-body)で、確認ボタンのテキストは「確 認」
-    #   （半角スペース入り）・クラスは ant-btn-primary ではなく ant-btn-default btn blue
-    #   だった。旧セレクタが一切マッチせず、毎回「確認ダイアログなし or 閉じ済み」と誤判定
-    #   してスキップしていたため、実際には対象パッケージが「発送手続き」タブへ一切移動され
-    #   ていなかった（ログ・GitHub Actionsは共に「Success」と表示されるため誰も気づけない
-    #   状態だった）。クリック後にダイアログが実際に消えたことまで検証してから次に進む。
+    #   （半角スペース入り）。クリック後にダイアログが実際に消えたことまで検証する。
     print("  確認ダイアログを待機...")
     dialog_closed = False
     for attempt in range(12):
         try:
             clicked = page.evaluate(
                 """() => {
-                    // ボタンテキストの空白を全て除去して「確認」「OK」と一致するものを探す
                     const btns = Array.from(document.querySelectorAll('button'));
                     for (const b of btns) {
                         const t = (b.textContent || '').replace(/\\s+/g, '');
@@ -585,8 +672,6 @@ def _move_all_to_processing(page):
                             return true;
                         }
                     }
-                    // フォールバック: 新UIの確認ダイアログ内で「閉じる」以外のボタン
-                    // （＝確認・続行ボタン）をクリック
                     const modal = document.querySelector(
                         '.sp-modal-dialog .prompt-modal-body, .prompt-modal-body'
                     );
@@ -617,9 +702,12 @@ def _move_all_to_processing(page):
     if not dialog_closed:
         print("    [ERROR] 確認ダイアログを閉じられませんでした（対象パッケージが移動されて"
               "いない可能性が高い。CPaSS側を要確認）")
+        time.sleep(3)
+        return _result(MOVE_STATUS_FAILED, "確認ダイアログを閉じられなかった（移動未完了の可能性）")
 
     time.sleep(3)
-    return True
+    return _result(MOVE_STATUS_MOVED,
+                   "発送手続き待ち" + str(len(waiting)) + "件（画面上）を発送手続きへ移動")
 
 
 def _os_click(page, viewport_x, viewport_y):
@@ -1689,7 +1777,7 @@ def _move_single_order_to_processing(page, order_no):
 
 
 def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiting=True,
-                                on_order_done=None, deadline_ts=None):
+                                on_order_done=None, deadline_ts=None, diagnostics=None):
     """「発送手続き待ち」で各注文を編集→DHL取得→発送手続きへ移動
 
     修正版: 編集ダイアログは「発送手続き待ち」タブにのみ存在する。
@@ -1717,6 +1805,14 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
             確認し、過ぎていれば無理に次の注文へ進まず、ここまでの結果を
             返して安全に終了する（GitHub Actionsの60分上限で強制キャンセル
             される前に、自分から安全に処理を打ち切るための仕組み）。
+
+        diagnostics: ★2026/09/25追加（省略可・後方互換）。dictを渡すと、実行状況を書き込む:
+              move_status / move_detail / waiting_order_nos … _move_all_to_processing の結果
+              processing_count … 発送手続きタブの全件数
+              matched_order_nos … 対象注文のうち発送手続きタブで見つかったもの
+              missing_order_nos … 対象注文のうち発送手続きタブで見つからなかったもの
+              safe_stopped … 45分SAFE STOPで打ち切ったか
+            呼び出し側(daily_workflow_ga.py)はこれで「処理0件」が正常か異常かを判定する。
 
     Returns:
         dict: {order_no: {package_no, dhl_price_jpy, title, item_id}}
@@ -1762,8 +1858,14 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
             # ★正しいフロー（2026/05/24 確認）:
             # Step A: 発送手続き待ち を全件 発送手続き へ一括移動
             # Step B: 発送手続き タブで「詳細を見る」→入力→配送を割り当て→DHL取得→保存
+            if diagnostics is None:
+                diagnostics = {}
+            diagnostics.setdefault("move_status", "not_run")
             if move_waiting:
-                _move_all_to_processing(page)
+                _mv = _move_all_to_processing(page) or {}
+                diagnostics["move_status"] = _mv.get("status", MOVE_STATUS_FAILED)
+                diagnostics["move_detail"] = _mv.get("detail", "")
+                diagnostics["waiting_order_nos"] = list(_mv.get("waiting_order_nos") or [])
 
             # 発送手続きタブへ移動して注文一覧を取得
             print("発送手続き 注文一覧取得...")
@@ -1789,6 +1891,7 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
             # ★2026/07/09修正: 1ページ目だけでなく全ページを巡回して収集する
             orders = _scrape_all_orders_with_pagination(page)
             print("  発送手続き 件数(全ページ合計): " + str(len(orders)))
+            diagnostics["processing_count"] = len(orders)
 
             # 対象フィルタ
             if target_order_nos is not None:
@@ -1802,6 +1905,14 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                           + str(len(missing)) + "件): " + ", ".join(sorted(missing)))
                 orders = [o for o in orders if o["order_no"] in target_set]
                 print("  対象絞り込み後: " + str(len(orders)) + " 件")
+                diagnostics["missing_order_nos"] = sorted(missing)
+                diagnostics["matched_order_nos"] = [o["order_no"] for o in orders]
+                _w = set(diagnostics.get("waiting_order_nos") or [])
+                _missing_but_waiting = sorted(missing & _w)
+                if _missing_but_waiting:
+                    print("  [ERROR] 発送手続き待ちにあった対象注文が発送手続きタブに移っていない: "
+                          + ", ".join(_missing_but_waiting))
+                    diagnostics["stuck_in_waiting_order_nos"] = _missing_but_waiting
 
             # 各注文を処理（待ちタブで編集 → 発送手続きへ移動）
             for idx, order in enumerate(orders):
@@ -1810,6 +1921,7 @@ def process_all_orders_for_dhl(target_order_nos=None, headless=False, move_waiti
                 if deadline_ts is not None and time.time() >= deadline_ts:
                     remaining = len(orders) - idx
                     print()
+                    diagnostics["safe_stopped"] = True
                     print("[SAFE STOP] 制限時間に近づいたため注文処理を安全に打ち切ります"
                           " (" + str(idx) + "/" + str(len(orders)) + "件処理済み、残り"
                           + str(remaining) + "件は次回実行時に自動的に継続されます)")
